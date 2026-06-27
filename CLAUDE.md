@@ -8,11 +8,13 @@ MollyBot is a Discord bot that replies in character as **Molly Simpson**, a
 character from the visual novel *Molly's Favourite Toy* by Zamalko. It listens
 in a Discord server and generates replies with the Anthropic API.
 
-The whole bot is two files:
+The bot is three files:
 
 - `bot.py` — all the Discord + Anthropic wiring.
 - `molly_prompt.py` — `MOLLY_SYSTEM_PROMPT`, the character/persona and all the
   behavioral rules. **Tune Molly's personality and behavior here**, not in code.
+- `memory.py` — the MySQL layer for persistent per-user memory (see below). Pure
+  mechanics; degrades to a no-op if the database isn't configured/reachable.
 
 `requirements.txt`, `Procfile`, `.python-version` (3.11) support deployment.
 
@@ -21,9 +23,11 @@ The whole bot is two files:
 - Deployed on **Railway**, which **auto-deploys on every push to `main`**. There
   is no separate build step — push and it ships.
 - Run locally: `python bot.py` (needs the env vars below in `.env`).
-- After changing `bot.py`/`molly_prompt.py`, sanity-check with
-  `python -m py_compile bot.py molly_prompt.py` before committing — there are no
-  unit tests.
+- After changing the Python files, sanity-check with
+  `python -m py_compile bot.py molly_prompt.py memory.py` before committing —
+  there are no unit tests. (`discord`/`aiomysql` may not be installed locally, so
+  a full import can fail even when the code is fine; `py_compile`, and pyflakes
+  if available, are the quick checks.)
 
 ## Configuration (environment variables)
 
@@ -36,6 +40,12 @@ The whole bot is two files:
   not the per-server nickname) allowed to use the height command; defaults to
   `ca11mebucky`. Gating on the handle is deliberate — it's globally unique and
   unspoofable, whereas anyone can copy a nickname.
+- `MYSQL_URL` — **optional**. Full connection string for Molly's persistent
+  per-user memory (`mysql://user:pass@host:port/db`); Railway's MySQL plugin
+  provides it. Without it (or if the DB is unreachable) memory silently no-ops
+  and the bot runs exactly as before. The individual `MYSQL*` vars Railway also
+  exposes (`MYSQLHOST`/`MYSQLUSER`/`MYSQLPASSWORD`/`MYSQLDATABASE`/`MYSQLPORT`)
+  are a fallback if `MYSQL_URL` isn't set.
 
 Tunable constants live at the top of `bot.py` (`MODEL`, `MAX_TOKENS`,
 `HISTORY_LIMIT`, `CONTEXT_MESSAGES`, `MAX_REACTIONS`, `GIF_COOLDOWN_SECONDS`,
@@ -64,9 +74,11 @@ Tunable constants live at the top of `bot.py` (`MODEL`, `MAX_TOKENS`,
   Discord *reply* aimed at another person (two people talking to each other),
   unless she's actually pinged — `replied_to_author_id()` checks the reply target;
   a reply to herself or to Molly still gets an answer.
-- **Memory**: history is **shared per channel** (keyed by `channel.id`), not per
-  user, so she sees the whole room. Each human turn is stored as `"Name: text"`
-  so she can tell people apart. Held in memory only — it resets on restart.
+- **Short-term history**: conversation history is **shared per channel** (keyed by
+  `channel.id`), not per user, so she sees the whole room. Each human turn is
+  stored as `"Name: text"` so she can tell people apart. Held in RAM only — it
+  resets on restart. (Distinct from the **persistent per-user memory** in
+  `memory.py`, below, which survives restarts.)
 - **Concurrency**: each message is handled under a **per-channel `asyncio.Lock`**
   (`get_channel_lock`); the reply work lives in `generate_and_reply()`. This
   serializes a channel's messages so simultaneous posts don't interleave on the
@@ -75,8 +87,15 @@ Tunable constants live at the top of `bot.py` (`MODEL`, `MAX_TOKENS`,
 - **Context backfill**: when pulled into a conversation she hasn't been tracking,
   `prime_channel_context` seeds history from the channel's recent messages (home
   channel once per run; other channels every time she's mentioned).
-- **Speaker names** come from `member_display_name()` (per-server nick, falling
-  back to the @handle).
+- **Speaker names** come from `resolve_member_name()` (per-server nick). It exists
+  because the old sync `member_display_name()` only hit the member *cache* and so
+  dropped to the **global** name for backfilled (REST `channel.history`) authors
+  while live gateway messages got the nick — the same person showing under two
+  labels (e.g. `zamalko` live vs `bucky` in history), which confused her and would
+  poison per-user memory. `resolve_member_name()` adds a cached one-off
+  `fetch_member` fallback so both paths agree; only people who've actually **left**
+  the guild fall back to the global name. `member_display_name()` is kept as the
+  sync fallback inside `message_to_turn`.
 - **Vision**: incoming image attachments, stickers, and custom emoji are attached
   as image blocks so she can actually see them (`collect_images`), with a
   text-only retry if an image fetch fails.
@@ -108,6 +127,33 @@ other text). It only fires from the `HEIGHT_CONTROLLER` handle and is checked in
 - The command itself triggers a one-off in-character reaction to the shift that is
   *not* stored in history either. Resets on restart.
 
+### Persistent per-user memory (`memory.py`)
+
+Durable facts Molly knows about individual people, surviving restarts. Backed by
+MySQL (`MYSQL_URL`); **degrades to a silent no-op** if the DB is unconfigured or
+down, like GIFs without `KLIPY_API_KEY`. `memory.init()` is called from
+`on_ready` (idempotent) and creates the `user_facts` table on first boot.
+
+- **Identity is the Discord `user_id`, never the name.** Facts are keyed by
+  `(guild_id, user_id)` — per-server scope — so the live-vs-backfill label wobble
+  can't split one person in two. The stored `display_name` is cosmetic (refreshed
+  each write) so the injected note reads nicely.
+- **Writing**: Molly emits `[remember: fact]` / `[forget: keyword]` tags (see
+  below). `process_memory_ops` (called at the *end* of `deliver_reply`, after the
+  message is sent, so a slow DB never blocks a reply) resolves the target and
+  upserts. A bare tag is about the **current speaker** (`memory_subject` — the
+  message author, or the reactor in the reaction path; the height path passes
+  none). `Name | fact` targets someone else, resolved against `recent_speakers`
+  (the per-channel `user_id → label` window, bounded by `MAX_TRACKED_SPEAKERS`).
+  Unresolvable targets are skipped, not guessed. Facts are deduped and pruned to
+  `MAX_FACTS_PER_USER` (in `memory.py`).
+- **Reading**: `build_memory_note()` pulls the recent speakers' stored facts and
+  appends a "WHAT YOU REMEMBER ABOUT THE PEOPLE HERE" block to the system prompt
+  each turn (in all three model-call paths). Costs one DB read per turn.
+- How eagerly she saves is governed by the prompt wording in `molly_prompt.py`
+  (the "YOUR MEMORY OF PEOPLE" section) **and** the caps in `memory.py` — tune
+  together, same as reactions/GIFs.
+
 ### Inline action tags (the key convention)
 
 Molly emits private tags in her reply text; `parse_actions` strips them out
@@ -118,6 +164,9 @@ Molly emits private tags in her reply text; `parse_actions` strips them out
 - `[gif: search terms]` — post a Klipy GIF (rate-limited by `GIF_COOLDOWN_SECONDS`
   per channel).
 - `[sticker: name]` — send one of the server's own stickers.
+- `[remember: fact]` / `[remember: Name | fact]` — save a durable per-user fact;
+  `[forget: keyword]` / `[forget: Name | keyword]` — drop matching facts. See the
+  persistent-memory section above.
 - `:custom_name:` in body text — replaced with real `<:name:id>` markup for the
   server's custom emoji (these *do* render in chat; unknown names stay as text).
 
@@ -128,8 +177,8 @@ governed by the prompt wording in `molly_prompt.py` **and** the hard caps in
 
 ## Conventions
 
-- Keep changes within these two files; match the existing comment-heavy style.
+- Keep changes within these files; match the existing comment-heavy style.
 - Persona/behavior wording → `molly_prompt.py`. Mechanics, limits, integrations →
-  `bot.py`.
+  `bot.py` (DB layer → `memory.py`).
 - Default to `claude-sonnet-4-6` (current `MODEL`); switching to a pricier model
   is a cost decision for the maintainer, not an automatic upgrade.

@@ -11,13 +11,14 @@ import os
 import random
 import re
 import time
-from collections import deque
+from collections import OrderedDict, deque
 
 import aiohttp
 import discord
 from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
 
+import memory
 from molly_prompt import MOLLY_SYSTEM_PROMPT
 
 load_dotenv()
@@ -57,6 +58,11 @@ MAX_PROMPT_STICKERS = 30
 REACT_TAG_RE = re.compile(r"\[react:\s*([^\]]+?)\s*\]", re.IGNORECASE)
 GIF_TAG_RE = re.compile(r"\[gif:\s*([^\]]+?)\s*\]", re.IGNORECASE)
 STICKER_TAG_RE = re.compile(r"\[sticker:\s*([^\]]+?)\s*\]", re.IGNORECASE)
+# Persistent memory tags (see memory.py). "[remember: fact]" stores a durable
+# fact about the current speaker; "[remember: Name | fact]" targets someone else
+# in the room. "[forget: ...]" drops matching facts the same way.
+REMEMBER_TAG_RE = re.compile(r"\[remember:\s*([^\]]+?)\s*\]", re.IGNORECASE)
+FORGET_TAG_RE = re.compile(r"\[forget:\s*([^\]]+?)\s*\]", re.IGNORECASE)
 EMOJI_SHORTCODE_RE = re.compile(r":([a-zA-Z0-9_]{2,32}):")
 # Custom emoji as they appear in raw message content: <:name:id> / <a:name:id>.
 CUSTOM_EMOJI_RE = re.compile(r"<(a)?:(\w+):(\d+)>")
@@ -102,6 +108,16 @@ primed_channels: set[int] = set()
 # concurrent handlers would otherwise interleave on the shared history deque and
 # cross-contaminate replies (answering two people as if they were the same one).
 channel_locks: dict[int, asyncio.Lock] = {}
+
+# Recent human speakers per channel, mapping Discord user id -> the display name
+# we last showed Molly for them. Drives two memory things: which people's stored
+# facts to inject this turn, and resolving a "[remember: Name | ...]" target back
+# to a real user id. Bounded so it stays a rolling window of the active room.
+MAX_TRACKED_SPEAKERS = 8
+recent_speakers: dict[int, "OrderedDict[int, str]"] = {}
+# Cache of (guild_id, user_id) -> per-server display name, so resolving the
+# nickname for a backfilled author costs at most one REST fetch per person.
+nick_cache: dict[tuple[int, int], str] = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -150,21 +166,30 @@ def build_request_messages(history: deque) -> list[dict]:
     return request_messages
 
 
-def parse_actions(reply_text: str) -> tuple[str, list[str], str | None, list[str]]:
+def parse_actions(
+    reply_text: str,
+) -> tuple[str, list[str], str | None, list[str], list[str], list[str]]:
     """Pull Molly's inline action tags out of her reply.
 
-    Returns (clean_text, reactions, gif_query, sticker_names): the message the
-    users actually see, up to MAX_REACTIONS emoji to react with, an optional GIF
-    search query (the last [gif:...] tag wins if she emits more than one), and up
-    to MAX_STICKERS server-sticker names to attach.
+    Returns (clean_text, reactions, gif_query, sticker_names, remembers,
+    forgets): the message the users actually see, up to MAX_REACTIONS emoji to
+    react with, an optional GIF search query (the last [gif:...] tag wins if she
+    emits more than one), up to MAX_STICKERS server-sticker names to attach, and
+    the raw bodies of any [remember:...] / [forget:...] memory tags (resolved to
+    a target user and persisted later, by process_memory_ops).
     """
     reactions = [m.strip() for m in REACT_TAG_RE.findall(reply_text)][:MAX_REACTIONS]
     gif_matches = GIF_TAG_RE.findall(reply_text)
     gif_query = gif_matches[-1].strip() if gif_matches else None
     sticker_names = [m.strip() for m in STICKER_TAG_RE.findall(reply_text)][:MAX_STICKERS]
+    remembers = [m.strip() for m in REMEMBER_TAG_RE.findall(reply_text)]
+    forgets = [m.strip() for m in FORGET_TAG_RE.findall(reply_text)]
 
-    clean_text = STICKER_TAG_RE.sub(
-        "", GIF_TAG_RE.sub("", REACT_TAG_RE.sub("", reply_text))
+    clean_text = FORGET_TAG_RE.sub(
+        "",
+        REMEMBER_TAG_RE.sub(
+            "", STICKER_TAG_RE.sub("", GIF_TAG_RE.sub("", REACT_TAG_RE.sub("", reply_text)))
+        ),
     )
     # Pulling a tag from mid-sentence can leave a double space; collapse runs of
     # spaces/tabs first.
@@ -175,7 +200,7 @@ def parse_actions(reply_text: str) -> tuple[str, list[str], str | None, list[str
     # gap in Discord. A run of newlines (with any blank-line whitespace between)
     # becomes one newline; deliberate single line breaks are left alone.
     clean_text = re.sub(r"\n[ \t]*(?:\n[ \t]*)+", "\n", clean_text).strip()
-    return clean_text, reactions, gif_query, sticker_names
+    return clean_text, reactions, gif_query, sticker_names, remembers, forgets
 
 
 def _first_gif_url(media: object) -> str | None:
@@ -340,6 +365,96 @@ def build_height_note(channel_id: int) -> str:
     )
 
 
+async def build_memory_note(guild: "discord.Guild | None", channel_id: int) -> str:
+    """Inject what Molly durably remembers about the people active in a channel.
+
+    Pulls stored facts for the recent speakers (see recent_speakers) and lays
+    them out per person so she can weave them in. Returns "" when memory is off,
+    we're not in a guild, or nobody present has any saved facts.
+    """
+    if guild is None or not memory.enabled():
+        return ""
+    speakers = recent_speakers.get(channel_id)
+    if not speakers:
+        return ""
+    user_ids = list(speakers.keys())
+    data = await memory.facts_for(guild.id, user_ids)
+    if not data:
+        return ""
+
+    lines = [
+        "",
+        "WHAT YOU REMEMBER ABOUT THE PEOPLE HERE:",
+        "- These are durable facts from past chats — treat them as true and let "
+        "them show that you know these people, but weave them in naturally; do "
+        "NOT recite them back like a list or announce that you remembered.",
+    ]
+    for user_id in user_ids:  # oldest-active first, current speaker last
+        entry = data.get(user_id)
+        if not entry or not entry[1]:
+            continue
+        name, facts = entry
+        lines.append(f"- {name}: {'; '.join(facts)}")
+    if len(lines) <= 3:
+        return ""
+    return "\n".join(lines)
+
+
+def _split_memory_target(raw: str) -> tuple[str | None, str]:
+    """Split a memory tag body into (target_name, text).
+
+    "Name | the fact" targets someone specific; a body with no "|" targets the
+    current speaker, so target_name is None.
+    """
+    if "|" in raw:
+        left, right = raw.split("|", 1)
+        return (left.strip() or None), right.strip()
+    return None, raw.strip()
+
+
+async def process_memory_ops(
+    message: discord.Message,
+    memory_subject,
+    remembers: list[str],
+    forgets: list[str],
+) -> None:
+    """Persist Molly's [remember:]/[forget:] tags after a reply is sent.
+
+    A bare tag is about `memory_subject` (the current speaker); "Name | text"
+    targets another recent speaker, resolved by display name back to their real
+    user id. Unresolvable targets are skipped rather than guessed. No-ops unless
+    memory is enabled and we're in a guild (per-server scope needs one).
+    """
+    guild = message.guild
+    if guild is None or not memory.enabled() or (not remembers and not forgets):
+        return
+    channel_id = message.channel.id
+
+    def resolve(target_name: str | None) -> tuple[int, str] | None:
+        if target_name:
+            wanted = target_name.lstrip("@").strip().lower()
+            for uid, label in recent_speakers.get(channel_id, {}).items():
+                if label.lower() == wanted:
+                    return uid, label
+            return None
+        if memory_subject is not None:
+            return memory_subject.id, member_display_name(guild, memory_subject)
+        return None
+
+    for raw in remembers:
+        target_name, fact = _split_memory_target(raw)
+        resolved = resolve(target_name)
+        if resolved and fact:
+            uid, label = resolved
+            await memory.remember(guild.id, uid, label, fact)
+    for raw in forgets:
+        target_name, needle = _split_memory_target(raw)
+        resolved = resolve(target_name)
+        if resolved and needle:
+            uid, _label = resolved
+            await memory.forget(guild.id, uid, needle)
+
+
 def collect_images(message: discord.Message) -> tuple[list[dict], list[str]]:
     """Gather viewable images from a message for Claude's vision.
 
@@ -392,12 +507,58 @@ def member_display_name(guild: "discord.Guild | None", author) -> str:
     return author.display_name
 
 
-def message_to_turn(msg: discord.Message) -> dict | None:
+async def resolve_member_name(guild: "discord.Guild | None", author) -> str:
+    """Per-server display name for `author`, resolved consistently everywhere.
+
+    member_display_name falls back to the GLOBAL name whenever the author isn't
+    in the member cache — which happens for backfilled (REST channel.history)
+    authors but not for live gateway messages. That made the same person show as
+    their nickname live and their global handle in history (e.g. "zamalko" vs
+    "bucky"), confusing Molly and any name-keyed bookkeeping. This resolves the
+    nickname the same in both paths by falling back to a one-off REST fetch
+    (cached per person), so only people who have actually LEFT the guild ever
+    drop to the global name.
+    """
+    if guild is None:
+        return author.display_name
+    member = guild.get_member(author.id)
+    if member is not None:
+        nick_cache[(guild.id, author.id)] = member.display_name
+        return member.display_name
+    cached = nick_cache.get((guild.id, author.id))
+    if cached is not None:
+        return cached
+    try:
+        member = await guild.fetch_member(author.id)
+    except Exception:  # noqa: BLE001 — left/uncached member just uses the global name
+        member = None
+    name = member.display_name if member is not None else author.display_name
+    nick_cache[(guild.id, author.id)] = name
+    return name
+
+
+def track_speaker(channel_id: int, user_id: int, name: str) -> None:
+    """Record a human speaker as recently-active in a channel (newest last).
+
+    Feeds both the per-user memory injection and "[remember: Name | ...]" target
+    resolution. Bounded to MAX_TRACKED_SPEAKERS so it's a rolling window.
+    """
+    speakers = recent_speakers.get(channel_id)
+    if speakers is None:
+        speakers = recent_speakers[channel_id] = OrderedDict()
+    speakers[user_id] = name
+    speakers.move_to_end(user_id)
+    while len(speakers) > MAX_TRACKED_SPEAKERS:
+        speakers.popitem(last=False)
+
+
+def message_to_turn(msg: discord.Message, name: str | None = None) -> dict | None:
     """Convert a Discord message into a history turn, or None if it's empty/skip.
 
     Molly's own messages become assistant turns; everyone else's become
     name-tagged user turns. Other bots are skipped. Stickers and image
-    attachments are noted in text so the context reads sensibly.
+    attachments are noted in text so the context reads sensibly. `name`, when
+    given, is the pre-resolved speaker label (see resolve_member_name).
     """
     if msg.author.bot and (client.user is None or msg.author.id != client.user.id):
         return None
@@ -415,8 +576,8 @@ def message_to_turn(msg: discord.Message) -> dict | None:
 
     if client.user is not None and msg.author.id == client.user.id:
         return {"role": "assistant", "content": text, "id": msg.id}
-    name = member_display_name(msg.guild, msg.author)
-    return {"role": "user", "content": f"{name}: {text}", "id": msg.id}
+    speaker = name if name is not None else member_display_name(msg.guild, msg.author)
+    return {"role": "user", "content": f"{speaker}: {text}", "id": msg.id}
 
 
 async def prime_channel_context(
@@ -436,7 +597,20 @@ async def prime_channel_context(
         print(f"Context backfill failed: {exc}")
         return
 
-    turns = [turn for msg in reversed(recent) if (turn := message_to_turn(msg))]
+    # Resolve each human author's nickname (with the REST fallback) so backfilled
+    # turns are labelled exactly like live ones, and note them as recent speakers
+    # so their stored memory is available the moment Molly is dropped back in.
+    turns: list[dict] = []
+    for msg in reversed(recent):
+        name = None
+        if not msg.author.bot:
+            name = await resolve_member_name(msg.guild, msg.author)
+        turn = message_to_turn(msg, name=name)
+        if turn is None:
+            continue
+        turns.append(turn)
+        if name is not None:
+            track_speaker(channel.id, msg.author.id, name)
     history.clear()
     history.extend(turns)
 
@@ -466,6 +640,9 @@ async def replied_to_author_id(message: discord.Message) -> int | None:
 
 @client.event
 async def on_ready() -> None:
+    # Bring up persistent memory (idempotent — on_ready can fire on reconnects).
+    # If MySQL isn't configured/reachable it just stays off and the bot runs on.
+    await memory.init()
     print(f"Logged in as {client.user} — listening in channel {CHANNEL_ID}")
 
 
@@ -582,7 +759,7 @@ async def generate_and_reply(
     if not text_repr:
         text_repr = "(no text)"
 
-    speaker = member_display_name(message.guild, message.author)
+    speaker = await resolve_member_name(message.guild, message.author)
     history = get_history(message.channel.id)
 
     # Prime with the channel's recent messages so she knows what's going on. Her
@@ -593,6 +770,10 @@ async def generate_and_reply(
     if not is_home or message.channel.id not in primed_channels:
         await prime_channel_context(message.channel, history, before=message)
         primed_channels.add(message.channel.id)
+
+    # Mark the speaker active *after* priming so they're the most-recent entry —
+    # drives memory injection and "[remember: Name | ...]" target resolution.
+    track_speaker(message.channel.id, message.author.id, speaker)
 
     # Tag every human turn with the speaker's display name so Molly can tell
     # the people in the channel apart and address each by name.
@@ -616,6 +797,7 @@ async def generate_and_reply(
         MOLLY_SYSTEM_PROMPT
         + build_emoji_sticker_note(message.guild)
         + build_height_note(message.channel.id)
+        + await build_memory_note(message.guild, message.channel.id)
     )
     try:
         async with message.channel.typing():
@@ -648,20 +830,29 @@ async def generate_and_reply(
     ).strip()
 
     # Perform her reactions/GIF/stickers and post the message, then record what
-    # she actually did so next turn's history stays coherent.
-    history_note = await deliver_reply(message, reply_text)
+    # she actually did so next turn's history stays coherent. Memory tags bind to
+    # the person she's replying to (the message author).
+    history_note = await deliver_reply(
+        message, reply_text, memory_subject=message.author
+    )
     history.append({"role": "assistant", "content": history_note})
 
 
-async def deliver_reply(message: discord.Message, reply_text: str) -> str:
+async def deliver_reply(
+    message: discord.Message, reply_text: str, *, memory_subject=None
+) -> str:
     """Act on Molly's raw reply and post it; return the text to store in history.
 
     Strips her inline action tags, performs the reactions/GIF/stickers they ask
-    for, renders custom-emoji shortcodes, and sends the visible message (chunked
-    to Discord's limit). Returns the cleaned text — or a short placeholder when
-    she only reacted/giffed/stickered — for the caller to record (or ignore).
+    for, persists any [remember:]/[forget:] memory tags (bound to memory_subject
+    by default), renders custom-emoji shortcodes, and sends the visible message
+    (chunked to Discord's limit). Returns the cleaned text — or a short
+    placeholder when she only reacted/giffed/stickered — for the caller to record
+    (or ignore).
     """
-    clean_text, reactions, gif_query, sticker_names = parse_actions(reply_text)
+    clean_text, reactions, gif_query, sticker_names, remembers, forgets = parse_actions(
+        reply_text
+    )
     guild = message.guild
 
     # Turn :name: shortcodes into real markup for this server's custom emoji.
@@ -723,6 +914,10 @@ async def deliver_reply(message: discord.Message, reply_text: str) -> str:
         else:
             await message.reply(gif_url)
 
+    # Persist any memory tags last, so a slow/failed DB write can never hold up
+    # or break the visible reply (process_memory_ops also swallows its own errors).
+    await process_memory_ops(message, memory_subject, remembers, forgets)
+
     return history_note
 
 
@@ -767,6 +962,7 @@ async def apply_height_shift(message: discord.Message, height: int) -> None:
         MOLLY_SYSTEM_PROMPT
         + build_emoji_sticker_note(message.guild)
         + build_height_note(channel_id)
+        + await build_memory_note(message.guild, channel_id)
     )
     try:
         async with message.channel.typing():
@@ -784,6 +980,7 @@ async def apply_height_shift(message: discord.Message, height: int) -> None:
         block.text for block in response.content if block.type == "text"
     ).strip()
     # Deliver her reaction but DON'T record it — keeps the shift out of memory.
+    # No memory_subject: a height jolt isn't the moment to save facts about anyone.
     await deliver_reply(message, reply_text)
 
 
@@ -801,10 +998,12 @@ async def respond_to_reaction(
 
     # Who reacted and with what. Custom emoji carry an id; unicode ones don't.
     reactor = (
-        member_display_name(message.guild, payload.member)
+        await resolve_member_name(message.guild, payload.member)
         if payload.member is not None
         else "someone"
     )
+    if payload.member is not None:
+        track_speaker(channel_id, payload.member.id, reactor)
     emoji = payload.emoji
     emoji_repr = f":{emoji.name}:" if emoji.id else emoji.name
     reacted_text = (message.clean_content or "").strip()
@@ -824,6 +1023,7 @@ async def respond_to_reaction(
         MOLLY_SYSTEM_PROMPT
         + build_emoji_sticker_note(message.guild)
         + build_height_note(channel_id)
+        + await build_memory_note(message.guild, channel_id)
     )
     try:
         async with message.channel.typing():
@@ -840,7 +1040,10 @@ async def respond_to_reaction(
     reply_text = "".join(
         block.text for block in response.content if block.type == "text"
     ).strip()
-    history_note = await deliver_reply(message, reply_text)
+    # Memory tags here are about the person who reacted, not Molly (the author).
+    history_note = await deliver_reply(
+        message, reply_text, memory_subject=payload.member
+    )
     history.append({"role": "assistant", "content": history_note})
 
 
