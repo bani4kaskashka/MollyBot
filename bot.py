@@ -6,6 +6,7 @@ channel she only responds when she is @-mentioned. History is kept per channel
 and replies are generated with the Anthropic API.
 """
 
+import asyncio
 import os
 import random
 import re
@@ -75,6 +76,10 @@ last_gif_at: dict[int, float] = {}
 histories: dict[int, deque] = {}
 # Channels whose history has been primed from Discord at least once this run.
 primed_channels: set[int] = set()
+# One lock per channel so messages are handled strictly one at a time there —
+# concurrent handlers would otherwise interleave on the shared history deque and
+# cross-contaminate replies (answering two people as if they were the same one).
+channel_locks: dict[int, asyncio.Lock] = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -91,6 +96,14 @@ def get_history(channel_id: int) -> deque:
     if channel_id not in histories:
         histories[channel_id] = deque(maxlen=HISTORY_LIMIT)
     return histories[channel_id]
+
+
+def get_channel_lock(channel_id: int) -> asyncio.Lock:
+    """Return (creating if needed) the per-channel handling lock."""
+    lock = channel_locks.get(channel_id)
+    if lock is None:
+        lock = channel_locks[channel_id] = asyncio.Lock()
+    return lock
 
 
 def build_request_messages(history: deque) -> list[dict]:
@@ -403,6 +416,25 @@ async def on_message(message: discord.Message) -> None:
     if not content and not image_blocks and not media_notes:
         return
 
+    # Serialize handling within a channel: if two people post at the same time,
+    # concurrent on_message coroutines would interleave on the shared history
+    # deque and Molly could answer both as the same person. The lock makes her
+    # work through a channel's messages one at a time, each with correct context.
+    async with get_channel_lock(message.channel.id):
+        await generate_and_reply(message, content, image_blocks, media_notes)
+
+
+async def generate_and_reply(
+    message: discord.Message,
+    content: str,
+    image_blocks: list[dict],
+    media_notes: list[str],
+) -> None:
+    """Build context, call the model, and post one reply for `message`.
+
+    The caller holds the channel lock, so this runs without another message in
+    the same channel mutating the shared history underneath it.
+    """
     # Build the textual record of the turn — the words plus short notes for any
     # media — so the stored (text-only) history stays coherent across turns.
     text_repr = " ".join(part for part in [content, *media_notes] if part).strip()
