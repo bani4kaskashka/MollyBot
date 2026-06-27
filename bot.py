@@ -51,6 +51,13 @@ REACT_TAG_RE = re.compile(r"\[react:\s*([^\]]+?)\s*\]", re.IGNORECASE)
 GIF_TAG_RE = re.compile(r"\[gif:\s*([^\]]+?)\s*\]", re.IGNORECASE)
 STICKER_TAG_RE = re.compile(r"\[sticker:\s*([^\]]+?)\s*\]", re.IGNORECASE)
 EMOJI_SHORTCODE_RE = re.compile(r":([a-zA-Z0-9_]{2,32}):")
+# Custom emoji as they appear in raw message content: <:name:id> / <a:name:id>.
+CUSTOM_EMOJI_RE = re.compile(r"<(a)?:(\w+):(\d+)>")
+
+# Vision: incoming images Molly can actually see (Claude-supported formats only).
+MAX_IMAGES = 8  # per message, to bound request size/cost
+SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+SUPPORTED_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
 
 anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 # Lazily-created shared HTTP session for Klipy GIF lookups.
@@ -251,6 +258,43 @@ def build_emoji_sticker_note(guild: "discord.Guild | None") -> str:
     return "\n".join(lines)
 
 
+def collect_images(message: discord.Message) -> tuple[list[dict], list[str]]:
+    """Gather viewable images from a message for Claude's vision.
+
+    Returns (image_blocks, notes): Anthropic URL image blocks for any image
+    attachments, stickers, and custom emoji in the message, plus short text
+    notes ("[image]", "[sticker: name]") describing them for the stored history.
+    Capped at MAX_IMAGES so a spammy message can't blow up the request.
+    """
+    blocks: list[dict] = []
+    notes: list[str] = []
+
+    def add(url: str) -> None:
+        blocks.append({"type": "image", "source": {"type": "url", "url": url}})
+
+    for att in message.attachments:
+        ctype = (att.content_type or "").lower()
+        if ctype in SUPPORTED_IMAGE_TYPES or att.filename.lower().endswith(
+            SUPPORTED_IMAGE_EXTS
+        ):
+            add(att.url)
+            notes.append("[image]")
+
+    for sticker in message.stickers:
+        notes.append(f"[sticker: {sticker.name}]")
+        # Lottie stickers are JSON, not viewable images — note them but skip.
+        if getattr(sticker.format, "name", "").lower() in ("png", "apng", "gif"):
+            add(sticker.url)
+
+    for match in CUSTOM_EMOJI_RE.finditer(message.content or ""):
+        animated, name, emoji_id = match.groups()
+        ext = "gif" if animated else "png"
+        add(f"https://cdn.discordapp.com/emojis/{emoji_id}.{ext}")
+        notes.append(f"[emoji: {name}]")
+
+    return blocks[:MAX_IMAGES], notes
+
+
 @client.event
 async def on_ready() -> None:
     print(f"Logged in as {client.user} — listening in channel {CHANNEL_ID}")
@@ -273,30 +317,61 @@ async def on_message(message: discord.Message) -> None:
         ):
             return
 
-    # Ignore empty messages (e.g. attachment-only posts). clean_content renders
-    # mentions as readable "@name" text instead of raw "<@id>" tokens, which
-    # also helps Molly keep track of who's who.
+    # clean_content renders mentions as readable "@name" instead of raw "<@id>".
     content = message.clean_content.strip()
-    if not content:
+    # Anything she can actually see: image attachments, stickers, custom emoji.
+    image_blocks, media_notes = collect_images(message)
+    # A sticker/image-only post has no text but should still get a reply; only
+    # bail when there's truly nothing (e.g. a non-image attachment).
+    if not content and not image_blocks and not media_notes:
         return
 
+    # Build the textual record of the turn — the words plus short notes for any
+    # media — so the stored (text-only) history stays coherent across turns.
+    text_repr = " ".join(part for part in [content, *media_notes] if part).strip()
+    if not text_repr:
+        text_repr = "(no text)"
+
     # Tag every human turn with the speaker's display name so Molly can tell
-    # the people in the channel apart and address each by name. The prefix is
-    # part of the stored content; the system prompt explains the convention.
+    # the people in the channel apart and address each by name.
     speaker = message.author.display_name
     history = get_history(message.channel.id)
-    history.append({"role": "user", "content": f"{speaker}: {content}"})
+    history.append({"role": "user", "content": f"{speaker}: {text_repr}"})
 
+    # Text-only payload (also the fallback if a vision request fails). For this
+    # turn only, attach the images to the final user block so Molly sees them
+    # without bloating stored history with image data.
     request_messages = build_request_messages(history)
+    vision_messages = request_messages
+    if image_blocks and request_messages:
+        last = dict(request_messages[-1])
+        text_value = last["content"] if isinstance(last["content"], str) else ""
+        text_part = [{"type": "text", "text": text_value}] if text_value else []
+        last["content"] = text_part + image_blocks
+        vision_messages = [*request_messages[:-1], last]
 
+    system_prompt = MOLLY_SYSTEM_PROMPT + build_emoji_sticker_note(message.guild)
     try:
         async with message.channel.typing():
-            response = await anthropic_client.messages.create(
-                model=MODEL,
-                max_tokens=MAX_TOKENS,
-                system=MOLLY_SYSTEM_PROMPT + build_emoji_sticker_note(message.guild),
-                messages=request_messages,
-            )
+            try:
+                response = await anthropic_client.messages.create(
+                    model=MODEL,
+                    max_tokens=MAX_TOKENS,
+                    system=system_prompt,
+                    messages=vision_messages,
+                )
+            except Exception as vision_exc:  # noqa: BLE001
+                # If an image couldn't be fetched/parsed, retry without images
+                # so she still answers instead of going silent.
+                if not image_blocks:
+                    raise
+                print(f"Vision request failed, retrying text-only: {vision_exc}")
+                response = await anthropic_client.messages.create(
+                    model=MODEL,
+                    max_tokens=MAX_TOKENS,
+                    system=system_prompt,
+                    messages=request_messages,
+                )
     except Exception as exc:  # noqa: BLE001 — surface any API/network failure
         print(f"Anthropic API error: {exc}")
         await message.reply("ugh my brain just glitched lol, gimme a sec n try again :c")
