@@ -44,6 +44,9 @@ MAX_REACTIONS = 4  # most emoji Molly may slap on a single message
 MAX_STICKERS = 3  # Discord's hard cap of stickers per message
 GIF_COOLDOWN_SECONDS = 60  # hard floor between GIFs per channel, so they stay a treat
 GIF_RATING = "pg-13"  # Klipy content rating: g < pg < pg-13 < r; this excludes r
+# Floor between Molly reacting to emoji-reactions on her own messages, per channel,
+# so a message getting reaction-spammed doesn't make her spam back.
+REACTION_REPLY_COOLDOWN = 45
 # How many server emoji/sticker names to list in the prompt, to bound token use.
 MAX_PROMPT_EMOJIS = 60
 MAX_PROMPT_STICKERS = 30
@@ -58,6 +61,18 @@ EMOJI_SHORTCODE_RE = re.compile(r":([a-zA-Z0-9_]{2,32}):")
 # Custom emoji as they appear in raw message content: <:name:id> / <a:name:id>.
 CUSTOM_EMOJI_RE = re.compile(r"<(a)?:(\w+):(\d+)>")
 
+# Zamalko's out-of-character height control. ONLY this exact account may use it,
+# and ONLY when the message is just the bare command, e.g. "$ set_molly_height_cm(30)".
+# It retunes Molly's size/mood for the channel in the moment — see molly_heights.
+# Gate on the Discord *handle* (message.author.name), which is globally unique and
+# can't be spoofed — NOT the per-server nickname, which anyone could copy. Override
+# via the HEIGHT_CONTROLLER env var if the controlling account ever changes.
+HEIGHT_CONTROLLER = os.environ.get("HEIGHT_CONTROLLER", "ca11mebucky").lower()
+HEIGHT_CMD_RE = re.compile(r"^\$\s*set_molly_height_cm\(\s*(\d+)\s*\)\s*$")
+# Her neutral baseline. Setting her to exactly this CLEARS the override, handing
+# height control back to her emotions (pure persona behaviour).
+BASELINE_HEIGHT_CM = 140
+
 # Vision: incoming images Molly can actually see (Claude-supported formats only).
 MAX_IMAGES = 8  # per message, to bound request size/cost
 SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
@@ -68,6 +83,13 @@ anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 _http_session: aiohttp.ClientSession | None = None
 # Per-channel timestamp (monotonic) of the last GIF, for the cooldown above.
 last_gif_at: dict[int, float] = {}
+# Per-channel current height (cm) set by Zamalko's control command. Held in
+# memory only and NEVER written to history, so it colours how Molly acts in the
+# moment without becoming something she "remembers" or repeats. Resets on
+# restart, and another command (e.g. back to 140) overrides it.
+molly_heights: dict[int, int] = {}
+# Per-channel cooldown clock for replying to reactions on her own messages.
+last_reaction_reply_at: dict[int, float] = {}
 
 # Shared conversation history, keyed by Discord *channel* ID so Molly sees the
 # whole room and can keep individuals straight. Each value is a bounded deque
@@ -284,6 +306,32 @@ def build_emoji_sticker_note(guild: "discord.Guild | None") -> str:
     return "\n".join(lines)
 
 
+def build_height_note(channel_id: int) -> str:
+    """If Zamalko has set a height for this channel, tell Molly her size right now.
+
+    Returns "" when no override is active. The wording leans on the persona's own
+    height/mood mapping (WHO YOU ARE) and the "size is background, not a news
+    ticker" rule, so she feels the size without reciting the number.
+    """
+    height = molly_heights.get(channel_id)
+    if height is None:
+        return ""
+    return (
+        "\n\nRIGHT NOW — YOUR CURRENT SIZE:\n"
+        f"- Zamalko has set your height to {height}cm right now (your neutral baseline "
+        f"is {BASELINE_HEIGHT_CM}cm). That's the size you are at the moment, so act it.\n"
+        "- Let it set your mood the way WHO YOU ARE describes: the shorter you are the "
+        "more small, shy, fragile and easily-flustered you feel; the taller you are the "
+        "more confident, bold, cocky, reckless and in-control you feel. The further from "
+        f"{BASELINE_HEIGHT_CM}cm, the harder it hits.\n"
+        "- You are NOT frozen at this size. Your feelings can still push you taller or "
+        "shorter from here in the moment, exactly like normal, when the chat genuinely "
+        "moves you — this number is just where you are right now, not a cage.\n"
+        "- Don't announce the number or narrate it like a status readout — just BE this "
+        "size and let it colour how you talk."
+    )
+
+
 def collect_images(message: discord.Message) -> tuple[list[dict], list[str]]:
     """Gather viewable images from a message for Claude's vision.
 
@@ -385,6 +433,29 @@ async def prime_channel_context(
     history.extend(turns)
 
 
+async def replied_to_author_id(message: discord.Message) -> int | None:
+    """The author id of the message this one is a Discord reply to, or None.
+
+    Lets Molly stay out of replies clearly aimed at someone else. Prefers the
+    already-resolved reference, falls back to a light fetch, and treats any
+    failure (deleted/uncached/no permission) as "unknown" by returning None —
+    in which case she just handles the message normally.
+    """
+    ref = message.reference
+    if ref is None:
+        return None
+    resolved = ref.resolved
+    if isinstance(resolved, discord.Message):
+        return resolved.author.id
+    if isinstance(resolved, discord.DeletedReferencedMessage) or ref.message_id is None:
+        return None
+    try:
+        original = await message.channel.fetch_message(ref.message_id)
+    except Exception:  # noqa: BLE001 — never let reply-detection block a response
+        return None
+    return original.author.id
+
+
 @client.event
 async def on_ready() -> None:
     print(f"Logged in as {client.user} — listening in channel {CHANNEL_ID}")
@@ -396,14 +467,38 @@ async def on_message(message: discord.Message) -> None:
     if message.author.bot:
         return
 
-    # CHANNEL_ID is Molly's home channel: she replies to everything there.
-    # Anywhere else she only speaks up when explicitly @-mentioned (a ping or a
-    # reply to her) — and message.reply() below answers exactly that message.
-    # @everyone/@here deliberately don't count, so she isn't dragged into mass
-    # pings in other channels.
-    if message.channel.id != CHANNEL_ID:
-        if client.user is None or not any(
-            user.id == client.user.id for user in message.mentions
+    # Zamalko's height control. Checked before the home-channel/mention gate so
+    # it works wherever he posts it — but ONLY from his exact account and ONLY
+    # when the message is just the bare "$ set_molly_height_cm(N)" command.
+    if message.author.name.lower() == HEIGHT_CONTROLLER:
+        cmd = HEIGHT_CMD_RE.match(message.content.strip())
+        if cmd:
+            async with get_channel_lock(message.channel.id):
+                await apply_height_shift(message, int(cmd.group(1)))
+            return
+
+    # Is Molly explicitly @-mentioned here? A direct ping or a reply-with-ping to
+    # her both land in message.mentions; @everyone/@here deliberately do NOT, so
+    # she isn't dragged into mass pings.
+    is_home = message.channel.id == CHANNEL_ID
+    mentioned = client.user is not None and any(
+        user.id == client.user.id for user in message.mentions
+    )
+
+    # CHANNEL_ID is her home channel (she replies to everything there); anywhere
+    # else she only speaks up when explicitly @-mentioned.
+    if not is_home and not mentioned:
+        return
+
+    # Even at home, stay out of a Discord reply aimed at *another person* — two
+    # people talking to each other — unless she was actually pinged. A reply to
+    # her own message, or one to Molly, still gets a response.
+    if is_home and not mentioned:
+        target_id = await replied_to_author_id(message)
+        if (
+            target_id is not None
+            and target_id != message.author.id
+            and (client.user is None or target_id != client.user.id)
         ):
             return
 
@@ -422,6 +517,44 @@ async def on_message(message: discord.Message) -> None:
     # work through a channel's messages one at a time, each with correct context.
     async with get_channel_lock(message.channel.id):
         await generate_and_reply(message, content, image_blocks, media_notes)
+
+
+@client.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
+    """When someone reacts to one of Molly's messages, she reacts back to it.
+
+    Raw (not cached) so it still fires for messages from before this run. Scoped
+    to channels she's active in, rate-limited per channel, and ignores her own
+    reactions and other bots so she doesn't spam or talk to herself.
+    """
+    if client.user is None or payload.user_id == client.user.id:
+        return
+    # Only bother in channels she actually talks in (home, or any she's been
+    # pulled into), so we don't fetch messages for reactions all over the server.
+    if payload.channel_id != CHANNEL_ID and payload.channel_id not in primed_channels:
+        return
+    # Other bots reacting shouldn't poke her.
+    if payload.member is not None and payload.member.bot:
+        return
+    # Cheap cooldown check first, so a reaction storm doesn't fetch on every hit.
+    now = time.monotonic()
+    if now - last_reaction_reply_at.get(payload.channel_id, 0.0) < REACTION_REPLY_COOLDOWN:
+        return
+
+    channel = client.get_channel(payload.channel_id)
+    if channel is None:
+        return
+    try:
+        message = await channel.fetch_message(payload.message_id)
+    except Exception:  # noqa: BLE001 — a missing/uncached message just means skip
+        return
+    # She only cares about reactions on HER OWN messages.
+    if message.author.id != client.user.id:
+        return
+
+    last_reaction_reply_at[payload.channel_id] = now
+    async with get_channel_lock(payload.channel_id):
+        await respond_to_reaction(message, payload)
 
 
 async def generate_and_reply(
@@ -471,7 +604,11 @@ async def generate_and_reply(
         last["content"] = text_part + image_blocks
         vision_messages = [*request_messages[:-1], last]
 
-    system_prompt = MOLLY_SYSTEM_PROMPT + build_emoji_sticker_note(message.guild)
+    system_prompt = (
+        MOLLY_SYSTEM_PROMPT
+        + build_emoji_sticker_note(message.guild)
+        + build_height_note(message.channel.id)
+    )
     try:
         async with message.channel.typing():
             try:
@@ -502,6 +639,20 @@ async def generate_and_reply(
         block.text for block in response.content if block.type == "text"
     ).strip()
 
+    # Perform her reactions/GIF/stickers and post the message, then record what
+    # she actually did so next turn's history stays coherent.
+    history_note = await deliver_reply(message, reply_text)
+    history.append({"role": "assistant", "content": history_note})
+
+
+async def deliver_reply(message: discord.Message, reply_text: str) -> str:
+    """Act on Molly's raw reply and post it; return the text to store in history.
+
+    Strips her inline action tags, performs the reactions/GIF/stickers they ask
+    for, renders custom-emoji shortcodes, and sends the visible message (chunked
+    to Discord's limit). Returns the cleaned text — or a short placeholder when
+    she only reacted/giffed/stickered — for the caller to record (or ignore).
+    """
     clean_text, reactions, gif_query, sticker_names = parse_actions(reply_text)
     guild = message.guild
 
@@ -535,11 +686,9 @@ async def generate_and_reply(
     if not clean_text and not reactions and not gif_url and not stickers:
         clean_text = "...uh. i blanked. say that again?"
 
-    # Record what she actually did so next turn's history stays coherent.
     history_note = clean_text or (
         "(sends a gif)" if gif_url else "(sends a sticker)" if stickers else "(reacts)"
     )
-    history.append({"role": "assistant", "content": history_note})
 
     # Send the text (chunked to Discord's limit) with any stickers attached to
     # the first message, then the gif. With no text but a sticker, the sticker
@@ -565,6 +714,126 @@ async def generate_and_reply(
             await message.channel.send(gif_url)
         else:
             await message.reply(gif_url)
+
+    return history_note
+
+
+async def apply_height_shift(message: discord.Message, height: int) -> None:
+    """Handle Zamalko's "$ set_molly_height_cm(N)" command for this channel.
+
+    Sets the channel's current height (which then colours every later reply via
+    build_height_note) and has Molly react to the change in the moment. The
+    command and her reaction are deliberately NOT written to history, so this
+    tweaks her behaviour without becoming something she "remembers" or repeats.
+    The caller holds the channel lock.
+    """
+    channel_id = message.channel.id
+    # Setting her to the neutral baseline clears the override entirely, so she goes
+    # back to shifting purely on emotion (no pinned size note). Any other value
+    # becomes her current size — which she can still drift from naturally.
+    if height == BASELINE_HEIGHT_CM:
+        molly_heights.pop(channel_id, None)
+    else:
+        molly_heights[channel_id] = height
+    history = get_history(channel_id)
+
+    # Catch up on the room so her reaction fits the conversation, exactly like a
+    # normal turn (home channel primed once, other channels every time).
+    is_home = channel_id == CHANNEL_ID
+    if not is_home or channel_id not in primed_channels:
+        await prime_channel_context(message.channel, history, before=message)
+        primed_channels.add(channel_id)
+
+    # A transient cue for THIS request only — never appended to history, so the
+    # shift stays out of her memory. build_height_note already states the size;
+    # this just tells her it happened right now so she reacts to the jolt.
+    cue = (
+        f"(You suddenly feel your body change — right this second you're {height}cm "
+        "tall. React to the shift in character, quick and natural. Don't mention "
+        "commands, numbers, or that anyone 'set' your height.)"
+    )
+    request_messages = build_request_messages(
+        [*history, {"role": "user", "content": cue}]
+    )
+    system_prompt = (
+        MOLLY_SYSTEM_PROMPT
+        + build_emoji_sticker_note(message.guild)
+        + build_height_note(channel_id)
+    )
+    try:
+        async with message.channel.typing():
+            response = await anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                system=system_prompt,
+                messages=request_messages,
+            )
+    except Exception as exc:  # noqa: BLE001 — surface API/network failure, stay alive
+        print(f"Anthropic API error (height shift): {exc}")
+        return
+
+    reply_text = "".join(
+        block.text for block in response.content if block.type == "text"
+    ).strip()
+    # Deliver her reaction but DON'T record it — keeps the shift out of memory.
+    await deliver_reply(message, reply_text)
+
+
+async def respond_to_reaction(
+    message: discord.Message, payload: discord.RawReactionActionEvent
+) -> None:
+    """Have Molly react in character to an emoji-reaction on her own message.
+
+    `message` is her own message that got reacted to; the caller holds the
+    channel lock and has already enforced the cooldown. The exchange goes into
+    history so it stays coherent with the rest of the conversation.
+    """
+    channel_id = message.channel.id
+    history = get_history(channel_id)
+
+    # Who reacted and with what. Custom emoji carry an id; unicode ones don't.
+    reactor = (
+        member_display_name(message.guild, payload.member)
+        if payload.member is not None
+        else "someone"
+    )
+    emoji = payload.emoji
+    emoji_repr = f":{emoji.name}:" if emoji.id else emoji.name
+    reacted_text = (message.clean_content or "").strip()
+    snippet = f' "{reacted_text}"' if reacted_text else ""
+
+    # Transient-style cue framed like the others; stored so the moment persists.
+    cue = (
+        f"({reactor} just reacted with {emoji_repr} to your message{snippet}. React "
+        "to getting that little reaction — quick and in character, like someone "
+        "clocking an emoji on something they said. Keep it light, sometimes barely "
+        "a word, and don't make a big deal of it.)"
+    )
+    history.append({"role": "user", "content": cue, "id": payload.message_id})
+
+    request_messages = build_request_messages(history)
+    system_prompt = (
+        MOLLY_SYSTEM_PROMPT
+        + build_emoji_sticker_note(message.guild)
+        + build_height_note(channel_id)
+    )
+    try:
+        async with message.channel.typing():
+            response = await anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                system=system_prompt,
+                messages=request_messages,
+            )
+    except Exception as exc:  # noqa: BLE001 — surface API/network failure, stay alive
+        print(f"Anthropic API error (reaction reply): {exc}")
+        return
+
+    reply_text = "".join(
+        block.text for block in response.content if block.type == "text"
+    ).strip()
+    history_note = await deliver_reply(message, reply_text)
+    history.append({"role": "assistant", "content": history_note})
 
 
 if __name__ == "__main__":
