@@ -37,13 +37,20 @@ MAX_TOKENS = 1000
 HISTORY_LIMIT = 40  # max messages (humans + Molly) retained per channel
 DISCORD_MAX_LEN = 2000  # Discord's hard cap per message
 MAX_REACTIONS = 3  # most emoji Molly may slap on a single message
+MAX_STICKERS = 3  # Discord's hard cap of stickers per message
 GIF_COOLDOWN_SECONDS = 90  # hard floor between GIFs per channel, so they stay rare
 GIF_RATING = "pg-13"  # Klipy content rating: g < pg < pg-13 < r; this excludes r
+# How many server emoji/sticker names to list in the prompt, to bound token use.
+MAX_PROMPT_EMOJIS = 60
+MAX_PROMPT_STICKERS = 30
 
-# Molly signals reactions/GIFs with inline tags the users never see; the bot
-# strips them out and acts on them. e.g. "[react:😂]" or "[gif: happy dance]".
+# Molly signals reactions/GIFs/stickers with inline tags the users never see;
+# the bot strips them out and acts on them, e.g. "[react:😂]", "[gif: happy
+# dance]", "[sticker: wave]". Custom server emoji she writes inline as :name:.
 REACT_TAG_RE = re.compile(r"\[react:\s*([^\]]+?)\s*\]", re.IGNORECASE)
 GIF_TAG_RE = re.compile(r"\[gif:\s*([^\]]+?)\s*\]", re.IGNORECASE)
+STICKER_TAG_RE = re.compile(r"\[sticker:\s*([^\]]+?)\s*\]", re.IGNORECASE)
+EMOJI_SHORTCODE_RE = re.compile(r":([a-zA-Z0-9_]{2,32}):")
 
 anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 # Lazily-created shared HTTP session for Klipy GIF lookups.
@@ -88,22 +95,26 @@ def build_request_messages(history: deque) -> list[dict]:
     return request_messages
 
 
-def parse_actions(reply_text: str) -> tuple[str, list[str], str | None]:
+def parse_actions(reply_text: str) -> tuple[str, list[str], str | None, list[str]]:
     """Pull Molly's inline action tags out of her reply.
 
-    Returns (clean_text, reactions, gif_query): the message the users actually
-    see, up to MAX_REACTIONS emoji to react with, and an optional GIF search
-    query (the last [gif:...] tag wins if she somehow emits more than one).
+    Returns (clean_text, reactions, gif_query, sticker_names): the message the
+    users actually see, up to MAX_REACTIONS emoji to react with, an optional GIF
+    search query (the last [gif:...] tag wins if she emits more than one), and up
+    to MAX_STICKERS server-sticker names to attach.
     """
     reactions = [m.strip() for m in REACT_TAG_RE.findall(reply_text)][:MAX_REACTIONS]
     gif_matches = GIF_TAG_RE.findall(reply_text)
     gif_query = gif_matches[-1].strip() if gif_matches else None
+    sticker_names = [m.strip() for m in STICKER_TAG_RE.findall(reply_text)][:MAX_STICKERS]
 
-    clean_text = GIF_TAG_RE.sub("", REACT_TAG_RE.sub("", reply_text))
+    clean_text = STICKER_TAG_RE.sub(
+        "", GIF_TAG_RE.sub("", REACT_TAG_RE.sub("", reply_text))
+    )
     # Pulling a tag from mid-sentence can leave a double space; collapse runs of
     # spaces/tabs without touching newlines.
     clean_text = re.sub(r"[ \t]{2,}", " ", clean_text).strip()
-    return clean_text, reactions, gif_query
+    return clean_text, reactions, gif_query, sticker_names
 
 
 def _first_gif_url(media: object) -> str | None:
@@ -171,6 +182,75 @@ async def fetch_gif(query: str) -> str | None:
     return _first_gif_url(item.get("file") or item.get("files"))
 
 
+def resolve_emoji_markup(text: str, guild: "discord.Guild | None") -> str:
+    """Replace ``:name:`` with real ``<:name:id>`` markup for this guild's emoji.
+
+    Unknown shortcodes (standard emoji, typos, false hits like times) are left
+    untouched, so the substitution is always safe.
+    """
+    if guild is None or not text:
+        return text
+    by_name = {e.name.lower(): e for e in guild.emojis}
+
+    def repl(match: "re.Match[str]") -> str:
+        emoji = by_name.get(match.group(1).lower())
+        return str(emoji) if emoji else match.group(0)
+
+    return EMOJI_SHORTCODE_RE.sub(repl, text)
+
+
+def resolve_reaction(token: str, guild: "discord.Guild | None"):
+    """Turn a react token into something add_reaction accepts.
+
+    A ``:name:`` / ``name`` matching one of the guild's custom emoji becomes
+    that emoji object; anything else is passed through as a unicode emoji.
+    """
+    name = token.strip().strip(":")
+    if guild is not None:
+        for emoji in guild.emojis:
+            if emoji.name.lower() == name.lower():
+                return emoji
+    return token
+
+
+def resolve_stickers(names: list[str], guild: "discord.Guild | None") -> list:
+    """Map sticker names to this guild's GuildSticker objects (server-only)."""
+    if guild is None or not names:
+        return []
+    by_name = {s.name.lower(): s for s in guild.stickers}
+    found = [by_name[n.lower()] for n in names if n.lower() in by_name]
+    return found[:MAX_STICKERS]
+
+
+def build_emoji_sticker_note(guild: "discord.Guild | None") -> str:
+    """Tell Molly which custom emoji and stickers this server actually has."""
+    if guild is None:
+        return ""
+    emojis = list(guild.emojis)[:MAX_PROMPT_EMOJIS]
+    stickers = list(guild.stickers)[:MAX_PROMPT_STICKERS]
+    if not emojis and not stickers:
+        return ""
+
+    lines = ["", "SERVER EMOJI & STICKERS AVAILABLE TO YOU RIGHT NOW:"]
+    if emojis:
+        names = " ".join(f":{e.name}:" for e in emojis)
+        more = " (and more)" if len(guild.emojis) > len(emojis) else ""
+        lines.append(f"- Custom emoji — drop them inline as :name: — {names}{more}")
+    else:
+        lines.append("- Custom emoji: none on this server.")
+    if stickers:
+        names = ", ".join(f'"{s.name}"' for s in stickers)
+        more = " (and more)" if len(guild.stickers) > len(stickers) else ""
+        lines.append(f"- Stickers — send one with [sticker: name] — {names}{more}")
+    else:
+        lines.append("- Stickers: none on this server.")
+    lines.append(
+        "Use ONLY names from these exact lists. If nothing fits, skip it — never "
+        "invent emoji or sticker names."
+    )
+    return "\n".join(lines)
+
+
 @client.event
 async def on_ready() -> None:
     print(f"Logged in as {client.user} — listening in channel {CHANNEL_ID}")
@@ -214,7 +294,7 @@ async def on_message(message: discord.Message) -> None:
             response = await anthropic_client.messages.create(
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
-                system=MOLLY_SYSTEM_PROMPT,
+                system=MOLLY_SYSTEM_PROMPT + build_emoji_sticker_note(message.guild),
                 messages=request_messages,
             )
     except Exception as exc:  # noqa: BLE001 — surface any API/network failure
@@ -226,14 +306,23 @@ async def on_message(message: discord.Message) -> None:
         block.text for block in response.content if block.type == "text"
     ).strip()
 
-    clean_text, reactions, gif_query = parse_actions(reply_text)
+    clean_text, reactions, gif_query, sticker_names = parse_actions(reply_text)
+    guild = message.guild
 
-    # React to the triggering message. A bad/unknown emoji is just skipped.
-    for emoji in reactions:
+    # Turn :name: shortcodes into real markup for this server's custom emoji.
+    clean_text = resolve_emoji_markup(clean_text, guild)
+
+    # React to the triggering message (unicode or a custom server emoji). A
+    # bad/unknown emoji is just skipped.
+    for token in reactions:
+        emoji = resolve_reaction(token, guild)
         try:
             await message.add_reaction(emoji)
         except Exception as exc:  # noqa: BLE001 — a bad emoji must not kill the reply
-            print(f"add_reaction failed for {emoji!r}: {exc}")
+            print(f"add_reaction failed for {token!r}: {exc}")
+
+    # Resolve any server stickers she asked for (server-only, capped).
+    stickers = resolve_stickers(sticker_names, guild)
 
     # Resolve a GIF, but only if this channel's cooldown has elapsed, so GIFs
     # stay an occasional treat instead of every-other-message spam.
@@ -245,29 +334,41 @@ async def on_message(message: discord.Message) -> None:
             if gif_url:
                 last_gif_at[message.channel.id] = now
 
-    # If she said nothing, reacted with nothing, and has no gif, fall back to a
-    # line so the user always gets some response.
-    if not clean_text and not reactions and not gif_url:
+    # If she produced nothing at all, fall back to a line so the user always
+    # gets some response.
+    if not clean_text and not reactions and not gif_url and not stickers:
         clean_text = "...uh. i blanked. say that again?"
 
     # Record what she actually did so next turn's history stays coherent.
-    history_note = clean_text or ("(sends a gif)" if gif_url else "(reacts)")
+    history_note = clean_text or (
+        "(sends a gif)" if gif_url else "(sends a sticker)" if stickers else "(reacts)"
+    )
     history.append({"role": "assistant", "content": history_note})
 
-    # Send the text (chunked to Discord's limit), then the gif if any. With no
-    # text, the gif carries the reply; with neither, the reaction alone stands.
+    # Send the text (chunked to Discord's limit) with any stickers attached to
+    # the first message, then the gif. With no text but a sticker, the sticker
+    # carries the reply; with only a gif, the gif does; otherwise the reaction
+    # alone stands.
+    sticker_kwargs = {"stickers": stickers} if stickers else {}
+    sent = False
     if clean_text:
         chunks = [
             clean_text[i:i + DISCORD_MAX_LEN]
             for i in range(0, len(clean_text), DISCORD_MAX_LEN)
         ]
-        await message.reply(chunks[0])
+        await message.reply(chunks[0], **sticker_kwargs)
         for chunk in chunks[1:]:
             await message.channel.send(chunk)
-        if gif_url:
+        sent = True
+    elif stickers:
+        await message.reply(**sticker_kwargs)
+        sent = True
+
+    if gif_url:
+        if sent:
             await message.channel.send(gif_url)
-    elif gif_url:
-        await message.reply(gif_url)
+        else:
+            await message.reply(gif_url)
 
 
 if __name__ == "__main__":
