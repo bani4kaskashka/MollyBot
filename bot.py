@@ -1,9 +1,9 @@
 """MollyBot — a Discord bot that replies in character as Molly Simpson.
 
-Listens only in the channel named by CHANNEL_ID, keeps a short *shared*
-conversation history per channel (with each human message tagged by the
-speaker's name so Molly can tell people apart), and generates replies with
-the Anthropic API.
+In her home channel (CHANNEL_ID) Molly replies to every message; in any other
+channel she only responds when she is @-mentioned. History is kept per channel
+(each human turn tagged with the speaker's name so she can tell people apart),
+and replies are generated with the Anthropic API.
 """
 
 import os
@@ -182,12 +182,21 @@ async def on_message(message: discord.Message) -> None:
     if message.author.bot:
         return
 
-    # Only listen in the designated channel.
+    # CHANNEL_ID is Molly's home channel: she replies to everything there.
+    # Anywhere else she only speaks up when explicitly @-mentioned (a ping or a
+    # reply to her) — and message.reply() below answers exactly that message.
+    # @everyone/@here deliberately don't count, so she isn't dragged into mass
+    # pings in other channels.
     if message.channel.id != CHANNEL_ID:
-        return
+        if client.user is None or not any(
+            user.id == client.user.id for user in message.mentions
+        ):
+            return
 
-    # Ignore empty messages (e.g. attachment-only posts).
-    content = message.content.strip()
+    # Ignore empty messages (e.g. attachment-only posts). clean_content renders
+    # mentions as readable "@name" text instead of raw "<@id>" tokens, which
+    # also helps Molly keep track of who's who.
+    content = message.clean_content.strip()
     if not content:
         return
 
