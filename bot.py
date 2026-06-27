@@ -31,7 +31,7 @@ CHANNEL_ID = int(os.environ["CHANNEL_ID"])
 KLIPY_API_KEY = os.environ.get("KLIPY_API_KEY")
 
 MODEL = "claude-sonnet-4-6"
-MAX_TOKENS = 1500  # max length of one reply (the prompt still keeps her concise)
+MAX_TOKENS = 1000  # a hard ceiling, not a target — the prompt keeps replies short
 # Shared history is now spread across everyone in the channel, so it needs to
 # hold more turns than a single 1:1 thread did.
 HISTORY_LIMIT = 60  # max messages (humans + Molly) retained per channel
@@ -78,6 +78,11 @@ primed_channels: set[int] = set()
 
 intents = discord.Intents.default()
 intents.message_content = True
+# Privileged "Server Members" intent — needed so the guild member cache is
+# populated and we can resolve per-server nicknames for authors of messages
+# fetched via channel.history() (REST history carries no inline member data).
+# Must also be enabled in the Discord Developer Portal or the bot won't start.
+intents.members = True
 client = discord.Client(intents=intents)
 
 
@@ -303,6 +308,21 @@ def collect_images(message: discord.Message) -> tuple[list[dict], list[str]]:
     return blocks[:MAX_IMAGES], notes
 
 
+def member_display_name(guild: "discord.Guild | None", author) -> str:
+    """The author's per-server nickname when available, else their global name.
+
+    Messages from channel.history() (REST) carry no inline member data, so
+    author.display_name there falls back to the @handle. Looking the author up
+    in the guild's member cache (populated by the members intent) recovers the
+    nickname people actually go by in this server.
+    """
+    if guild is not None:
+        member = guild.get_member(author.id)
+        if member is not None:
+            return member.display_name
+    return author.display_name
+
+
 def message_to_turn(msg: discord.Message) -> dict | None:
     """Convert a Discord message into a history turn, or None if it's empty/skip.
 
@@ -326,7 +346,8 @@ def message_to_turn(msg: discord.Message) -> dict | None:
 
     if client.user is not None and msg.author.id == client.user.id:
         return {"role": "assistant", "content": text, "id": msg.id}
-    return {"role": "user", "content": f"{msg.author.display_name}: {text}", "id": msg.id}
+    name = member_display_name(msg.guild, msg.author)
+    return {"role": "user", "content": f"{name}: {text}", "id": msg.id}
 
 
 async def prime_channel_context(
@@ -388,7 +409,7 @@ async def on_message(message: discord.Message) -> None:
     if not text_repr:
         text_repr = "(no text)"
 
-    speaker = message.author.display_name
+    speaker = member_display_name(message.guild, message.author)
     history = get_history(message.channel.id)
 
     # Prime with the channel's recent messages so she knows what's going on. Her
