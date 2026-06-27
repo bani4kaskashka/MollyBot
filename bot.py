@@ -167,8 +167,14 @@ def parse_actions(reply_text: str) -> tuple[str, list[str], str | None, list[str
         "", GIF_TAG_RE.sub("", REACT_TAG_RE.sub("", reply_text))
     )
     # Pulling a tag from mid-sentence can leave a double space; collapse runs of
-    # spaces/tabs without touching newlines.
-    clean_text = re.sub(r"[ \t]{2,}", " ", clean_text).strip()
+    # spaces/tabs first.
+    clean_text = re.sub(r"[ \t]{2,}", " ", clean_text)
+    # Then squash blank lines down to a single newline. The model likes to
+    # double-space its lines (markdown paragraph habit), and stripping a tag off
+    # its own line leaves an empty line behind — both render as an ugly vertical
+    # gap in Discord. A run of newlines (with any blank-line whitespace between)
+    # becomes one newline; deliberate single line breaks are left alone.
+    clean_text = re.sub(r"\n[ \t]*(?:\n[ \t]*)+", "\n", clean_text).strip()
     return clean_text, reactions, gif_query, sticker_names
 
 
