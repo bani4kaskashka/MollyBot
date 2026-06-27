@@ -1,3 +1,4 @@
 discord.py
 anthropic
 python-dotenv
+aiohttp
