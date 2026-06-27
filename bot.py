@@ -31,10 +31,13 @@ CHANNEL_ID = int(os.environ["CHANNEL_ID"])
 KLIPY_API_KEY = os.environ.get("KLIPY_API_KEY")
 
 MODEL = "claude-sonnet-4-6"
-MAX_TOKENS = 1000
+MAX_TOKENS = 1500  # max length of one reply (the prompt still keeps her concise)
 # Shared history is now spread across everyone in the channel, so it needs to
 # hold more turns than a single 1:1 thread did.
-HISTORY_LIMIT = 40  # max messages (humans + Molly) retained per channel
+HISTORY_LIMIT = 60  # max messages (humans + Molly) retained per channel
+# When Molly is pulled into a conversation she hasn't been tracking, prime her
+# with this many of the channel's recent messages so she knows what's going on.
+CONTEXT_MESSAGES = 10
 DISCORD_MAX_LEN = 2000  # Discord's hard cap per message
 MAX_REACTIONS = 3  # most emoji Molly may slap on a single message
 MAX_STICKERS = 3  # Discord's hard cap of stickers per message
@@ -70,6 +73,8 @@ last_gif_at: dict[int, float] = {}
 # of {"role": ..., "content": ...} dicts; human turns carry a "Name: text"
 # prefix. The deque drops the oldest message once HISTORY_LIMIT is exceeded.
 histories: dict[int, deque] = {}
+# Channels whose history has been primed from Discord at least once this run.
+primed_channels: set[int] = set()
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -95,7 +100,10 @@ def build_request_messages(history: deque) -> list[dict]:
         if request_messages and request_messages[-1]["role"] == entry["role"]:
             request_messages[-1]["content"] += "\n" + entry["content"]
         else:
-            request_messages.append(dict(entry))
+            # Only role/content reach the API — drop bookkeeping keys like "id".
+            request_messages.append(
+                {"role": entry["role"], "content": entry["content"]}
+            )
 
     while request_messages and request_messages[0]["role"] != "user":
         request_messages.pop(0)
@@ -295,6 +303,54 @@ def collect_images(message: discord.Message) -> tuple[list[dict], list[str]]:
     return blocks[:MAX_IMAGES], notes
 
 
+def message_to_turn(msg: discord.Message) -> dict | None:
+    """Convert a Discord message into a history turn, or None if it's empty/skip.
+
+    Molly's own messages become assistant turns; everyone else's become
+    name-tagged user turns. Other bots are skipped. Stickers and image
+    attachments are noted in text so the context reads sensibly.
+    """
+    if msg.author.bot and (client.user is None or msg.author.id != client.user.id):
+        return None
+
+    notes = [f"[sticker: {s.name}]" for s in msg.stickers]
+    if any(
+        (att.content_type or "").lower() in SUPPORTED_IMAGE_TYPES
+        or att.filename.lower().endswith(SUPPORTED_IMAGE_EXTS)
+        for att in msg.attachments
+    ):
+        notes.append("[image]")
+    text = " ".join(p for p in [msg.clean_content.strip(), *notes] if p).strip()
+    if not text:
+        return None
+
+    if client.user is not None and msg.author.id == client.user.id:
+        return {"role": "assistant", "content": text, "id": msg.id}
+    return {"role": "user", "content": f"{msg.author.display_name}: {text}", "id": msg.id}
+
+
+async def prime_channel_context(
+    channel: discord.abc.Messageable, history: deque, before: discord.Message
+) -> None:
+    """Replace `history` with the channel's recent messages so Molly has context.
+
+    Pulls up to CONTEXT_MESSAGES messages just before `before`, oldest first, so
+    she knows what's going on when dropped into a conversation. Failures (e.g.
+    missing Read Message History) degrade gracefully to no context.
+    """
+    try:
+        recent = [
+            msg async for msg in channel.history(limit=CONTEXT_MESSAGES, before=before)
+        ]
+    except Exception as exc:  # noqa: BLE001 — never let backfill break a reply
+        print(f"Context backfill failed: {exc}")
+        return
+
+    turns = [turn for msg in reversed(recent) if (turn := message_to_turn(msg))]
+    history.clear()
+    history.extend(turns)
+
+
 @client.event
 async def on_ready() -> None:
     print(f"Logged in as {client.user} — listening in channel {CHANNEL_ID}")
@@ -332,11 +388,23 @@ async def on_message(message: discord.Message) -> None:
     if not text_repr:
         text_repr = "(no text)"
 
-    # Tag every human turn with the speaker's display name so Molly can tell
-    # the people in the channel apart and address each by name.
     speaker = message.author.display_name
     history = get_history(message.channel.id)
-    history.append({"role": "user", "content": f"{speaker}: {text_repr}"})
+
+    # Prime with the channel's recent messages so she knows what's going on. Her
+    # home channel is primed once (she then sees everything live); other channels
+    # — where she's only present when @-mentioned — are re-primed every time so
+    # she catches up on whatever was said while she was away.
+    is_home = message.channel.id == CHANNEL_ID
+    if not is_home or message.channel.id not in primed_channels:
+        await prime_channel_context(message.channel, history, before=message)
+        primed_channels.add(message.channel.id)
+
+    # Tag every human turn with the speaker's display name so Molly can tell
+    # the people in the channel apart and address each by name.
+    history.append(
+        {"role": "user", "content": f"{speaker}: {text_repr}", "id": message.id}
+    )
 
     # Text-only payload (also the fallback if a vision request fails). For this
     # turn only, attach the images to the final user block so Molly sees them
