@@ -39,9 +39,9 @@ HISTORY_LIMIT = 60  # max messages (humans + Molly) retained per channel
 # with this many of the channel's recent messages so she knows what's going on.
 CONTEXT_MESSAGES = 10
 DISCORD_MAX_LEN = 2000  # Discord's hard cap per message
-MAX_REACTIONS = 6  # most emoji Molly may slap on a single message
+MAX_REACTIONS = 4  # most emoji Molly may slap on a single message
 MAX_STICKERS = 3  # Discord's hard cap of stickers per message
-GIF_COOLDOWN_SECONDS = 30  # hard floor between GIFs per channel, so they don't fully spam
+GIF_COOLDOWN_SECONDS = 60  # hard floor between GIFs per channel, so they stay a treat
 GIF_RATING = "pg-13"  # Klipy content rating: g < pg < pg-13 < r; this excludes r
 # How many server emoji/sticker names to list in the prompt, to bound token use.
 MAX_PROMPT_EMOJIS = 60
