@@ -40,6 +40,13 @@ The bot is three files:
   not the per-server nickname) allowed to use the height command; defaults to
   `ca11mebucky`. Gating on the handle is deliberate — it's globally unique and
   unspoofable, whereas anyone can copy a nickname.
+- `MOLLY_CREATOR` — **optional**. Discord **handle** of Molly's creator (Zamalko);
+  defaults to `zamalkogts`. When this handle is the one talking to her,
+  `build_creator_note` injects a per-turn note so she addresses him directly
+  instead of referring to "Zamalko" in the third person ("Zamalko hasn't told
+  me…" while replying *to* Zamalko). Handle-gated for the same unspoofable reason
+  as `HEIGHT_CONTROLLER`. **Set this to Zamalko's real @username** if it isn't
+  `zamalkogts`.
 - `MYSQL_URL` — **optional**. Full connection string for Molly's persistent
   per-user memory (`mysql://user:pass@host:port/db`); Railway's MySQL plugin
   provides it. Without it (or if the DB is unreachable) memory silently no-ops

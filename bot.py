@@ -76,6 +76,12 @@ CUSTOM_EMOJI_RE = re.compile(r"<(a)?:(\w+):(\d+)>")
 # via the HEIGHT_CONTROLLER env var if the controlling account ever changes.
 HEIGHT_CONTROLLER = os.environ.get("HEIGHT_CONTROLLER", "ca11mebucky").lower()
 HEIGHT_CMD_RE = re.compile(r"^\$\s*set_molly_height_cm\(\s*(\d+)\s*\)\s*$")
+# Molly's creator. When the person CURRENTLY talking to her uses this handle, she
+# knows she's speaking to Zamalko himself and shouldn't refer to him in the third
+# person ("Zamalko hasn't told me") as if he weren't right there. Gated on the
+# handle (message.author.name — globally unique, unspoofable), like HEIGHT_CONTROLLER;
+# override via MOLLY_CREATOR if his account differs.
+MOLLY_CREATOR = os.environ.get("MOLLY_CREATOR", "zamalkogts").lower()
 # Her neutral baseline. Setting her to exactly this CLEARS the override, handing
 # height control back to her emotions (pure persona behaviour).
 BASELINE_HEIGHT_CM = 140
@@ -401,17 +407,37 @@ async def build_memory_note(guild: "discord.Guild | None", channel_id: int) -> s
     return "\n".join(lines)
 
 
+def build_creator_note(author) -> str:
+    """Tell Molly when her own creator is the one talking, so she addresses him
+    directly instead of name-dropping "Zamalko" like an absent third party.
+
+    Returns "" for everyone else. Gated on the handle so a copied nickname can't
+    impersonate the creator (same reasoning as HEIGHT_CONTROLLER).
+    """
+    if getattr(author, "name", "").lower() != MOLLY_CREATOR:
+        return ""
+    return (
+        "\n\nHEADS UP: the person talking to you RIGHT NOW is Zamalko himself — "
+        "your actual creator, the one who makes the game. Do NOT talk about "
+        '"Zamalko" in the third person, or say he hasn\'t told you things, as if '
+        "he weren't here — he is literally who you're replying to. Talk straight "
+        "to him: rib him that HE's the one keeping secrets, bug HIM about the "
+        "release date, creation-teasing-its-creator energy. Stay casual and in "
+        "character — don't get weird, formal, or worshippy about it."
+    )
+
+
 def build_system_blocks(
-    guild: "discord.Guild | None", channel_id: int, memory_note: str
+    guild: "discord.Guild | None", channel_id: int, memory_note: str, author=None
 ) -> list[dict]:
     """Assemble the system prompt as cacheable content blocks.
 
     The big, stable prefix — persona + this server's emoji/sticker list + any
     height override — goes in one block marked for prompt caching, so it's served
     from cache (~10% of input price) on repeat calls instead of being re-billed in
-    full on every single message (the dominant cost). The per-turn memory note is
-    volatile — it shifts as people speak and facts change — so it sits AFTER the
-    cache breakpoint, uncached, where it can't invalidate the cached prefix.
+    full on every single message (the dominant cost). The volatile, per-speaker
+    notes — whether the creator is talking, plus the per-turn memory note — sit
+    AFTER the cache breakpoint, uncached, where they can't invalidate the prefix.
 
     Caching only actually kicks in once the cached prefix clears the model's
     minimum (~4096 tokens on Haiku 4.5, ~2048 on Sonnet 4.6); under that it
@@ -425,8 +451,11 @@ def build_system_blocks(
     blocks: list[dict] = [
         {"type": "text", "text": stable, "cache_control": {"type": "ephemeral"}}
     ]
-    if memory_note:
-        blocks.append({"type": "text", "text": memory_note})
+    volatile = "".join(
+        part for part in (build_creator_note(author), memory_note) if part
+    )
+    if volatile:
+        blocks.append({"type": "text", "text": volatile})
     return blocks
 
 
@@ -827,6 +856,7 @@ async def generate_and_reply(
         message.guild,
         message.channel.id,
         await build_memory_note(message.guild, message.channel.id),
+        author=message.author,
     )
     try:
         async with message.channel.typing():
@@ -991,6 +1021,7 @@ async def apply_height_shift(message: discord.Message, height: int) -> None:
         message.guild,
         channel_id,
         await build_memory_note(message.guild, channel_id),
+        author=message.author,
     )
     try:
         async with message.channel.typing():
@@ -1051,6 +1082,7 @@ async def respond_to_reaction(
         message.guild,
         channel_id,
         await build_memory_note(message.guild, channel_id),
+        author=payload.member,
     )
     try:
         async with message.channel.typing():
