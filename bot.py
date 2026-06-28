@@ -32,11 +32,12 @@ CHANNEL_ID = int(os.environ["CHANNEL_ID"])
 # Tenor API stopped issuing keys in Jan 2026 and shuts down entirely 2026-06-30.
 KLIPY_API_KEY = os.environ.get("KLIPY_API_KEY")
 
-MODEL = "claude-sonnet-4-6"
+MODEL = "claude-haiku-4-5"  # cost choice: ~3x cheaper in/out than Sonnet 4.6
 MAX_TOKENS = 1000  # a hard ceiling, not a target — the prompt keeps replies short
-# Shared history is now spread across everyone in the channel, so it needs to
-# hold more turns than a single 1:1 thread did.
-HISTORY_LIMIT = 60  # max messages (humans + Molly) retained per channel
+# Shared history is spread across everyone in the channel. Kept moderate because
+# every message re-sends the whole window as input — the dominant cost driver —
+# so this is a direct lever on spend (was 60; halved to cut input tokens).
+HISTORY_LIMIT = 30  # max messages (humans + Molly) retained per channel
 # When Molly is pulled into a conversation she hasn't been tracking, prime her
 # with this many of the channel's recent messages so she knows what's going on.
 CONTEXT_MESSAGES = 10
@@ -398,6 +399,35 @@ async def build_memory_note(guild: "discord.Guild | None", channel_id: int) -> s
     if len(lines) <= 3:
         return ""
     return "\n".join(lines)
+
+
+def build_system_blocks(
+    guild: "discord.Guild | None", channel_id: int, memory_note: str
+) -> list[dict]:
+    """Assemble the system prompt as cacheable content blocks.
+
+    The big, stable prefix — persona + this server's emoji/sticker list + any
+    height override — goes in one block marked for prompt caching, so it's served
+    from cache (~10% of input price) on repeat calls instead of being re-billed in
+    full on every single message (the dominant cost). The per-turn memory note is
+    volatile — it shifts as people speak and facts change — so it sits AFTER the
+    cache breakpoint, uncached, where it can't invalidate the cached prefix.
+
+    Caching only actually kicks in once the cached prefix clears the model's
+    minimum (~4096 tokens on Haiku 4.5, ~2048 on Sonnet 4.6); under that it
+    harmlessly no-ops (no error, just nothing cached).
+    """
+    stable = (
+        MOLLY_SYSTEM_PROMPT
+        + build_emoji_sticker_note(guild)
+        + build_height_note(channel_id)
+    )
+    blocks: list[dict] = [
+        {"type": "text", "text": stable, "cache_control": {"type": "ephemeral"}}
+    ]
+    if memory_note:
+        blocks.append({"type": "text", "text": memory_note})
+    return blocks
 
 
 def _split_memory_target(raw: str) -> tuple[str | None, str]:
@@ -793,11 +823,10 @@ async def generate_and_reply(
         last["content"] = text_part + image_blocks
         vision_messages = [*request_messages[:-1], last]
 
-    system_prompt = (
-        MOLLY_SYSTEM_PROMPT
-        + build_emoji_sticker_note(message.guild)
-        + build_height_note(message.channel.id)
-        + await build_memory_note(message.guild, message.channel.id)
+    system_prompt = build_system_blocks(
+        message.guild,
+        message.channel.id,
+        await build_memory_note(message.guild, message.channel.id),
     )
     try:
         async with message.channel.typing():
@@ -958,11 +987,10 @@ async def apply_height_shift(message: discord.Message, height: int) -> None:
     request_messages = build_request_messages(
         [*history, {"role": "user", "content": cue}]
     )
-    system_prompt = (
-        MOLLY_SYSTEM_PROMPT
-        + build_emoji_sticker_note(message.guild)
-        + build_height_note(channel_id)
-        + await build_memory_note(message.guild, channel_id)
+    system_prompt = build_system_blocks(
+        message.guild,
+        channel_id,
+        await build_memory_note(message.guild, channel_id),
     )
     try:
         async with message.channel.typing():
@@ -1019,11 +1047,10 @@ async def respond_to_reaction(
     history.append({"role": "user", "content": cue, "id": payload.message_id})
 
     request_messages = build_request_messages(history)
-    system_prompt = (
-        MOLLY_SYSTEM_PROMPT
-        + build_emoji_sticker_note(message.guild)
-        + build_height_note(channel_id)
-        + await build_memory_note(message.guild, channel_id)
+    system_prompt = build_system_blocks(
+        message.guild,
+        channel_id,
+        await build_memory_note(message.guild, channel_id),
     )
     try:
         async with message.channel.typing():

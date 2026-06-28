@@ -180,5 +180,11 @@ governed by the prompt wording in `molly_prompt.py` **and** the hard caps in
 - Keep changes within these files; match the existing comment-heavy style.
 - Persona/behavior wording → `molly_prompt.py`. Mechanics, limits, integrations →
   `bot.py` (DB layer → `memory.py`).
-- Default to `claude-sonnet-4-6` (current `MODEL`); switching to a pricier model
-  is a cost decision for the maintainer, not an automatic upgrade.
+- `MODEL` is `claude-haiku-4-5` — a deliberate **cost** choice (~3x cheaper
+  in/out than Sonnet 4.6). Moving to a pricier model (Sonnet/Opus) is the
+  maintainer's call, not an automatic upgrade. The system prompt is sent as
+  cacheable content blocks via `build_system_blocks` (stable persona/emoji/height
+  prefix cached, volatile memory note after the breakpoint); prompt caching only
+  engages once that prefix clears the model minimum (~4096 tokens on Haiku 4.5),
+  otherwise it harmlessly no-ops. `HISTORY_LIMIT` is the other main spend lever —
+  the whole window is re-sent as input every message.
