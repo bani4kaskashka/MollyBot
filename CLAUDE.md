@@ -69,7 +69,13 @@ Tunable constants live at the top of `bot.py` (`MODEL`, `MAX_TOKENS`,
     global @handle. Enabling it in code but not the portal **crashes the bot on
     startup**.
 - **Permissions**: View Channels, Send Messages, Read Message History, Add
-  Reactions, **Embed Links** (so posted GIF links unfurl).
+  Reactions, **Embed Links** (so posted GIF links unfurl), **Create Private
+  Threads** + **Send Messages in Threads** (so `[thread:]`/`[invite:]` work —
+  without them thread creation silently fails and logs `[thread] create failed`).
+- **Slash commands** need the bot invited with the **`applications.commands`**
+  scope (in addition to `bot`). Without it `/mollynewchat` won't appear; re-invite
+  with that scope ticked. The command is synced to Molly's own guild only (derived
+  from the home channel) so it shows up there instantly and nowhere else.
 - The **reactions** intent (for `on_raw_reaction_add`, see below) is *not*
   privileged — it's already on via `Intents.default()`, so no extra portal step.
 
@@ -137,6 +143,29 @@ other text). It only fires from the `HEIGHT_CONTROLLER` handle and is checked in
 - The command itself triggers a one-off in-character reaction to the shift that is
   *not* stored in history either. Resets on restart.
 
+### `/mollynewchat` slash command (controller only)
+
+A Discord **slash** command (not a `$` text command like height) that wipes a
+channel's **short-term** conversation so Molly starts fresh. Defined on `tree`
+(an `app_commands.CommandTree` over the plain `Client`) and **synced only to
+Molly's own guild** in `on_ready` — derived from the home channel's `.guild` via
+`copy_global_to` + `tree.sync(guild=...)`, so it appears in that one server,
+instantly, and nowhere else (no `GUILD_ID` env needed). Slash commands need the
+bot invited with the `applications.commands` scope; if it doesn't appear,
+re-invite with that scope.
+
+- Gated to the `HEIGHT_CONTROLLER` handle (same unspoofable owner identity as the
+  height command); anyone else gets an ephemeral "only my person" brush-off.
+- Works in **any** channel. It pops the channel's `histories` deque and
+  `recent_speakers`, then records `fresh_start_at[channel_id]` — a boundary that
+  `prime_channel_context` honours (skipping every message at/before it) so context
+  backfill can't quietly undo the reset. The boundary persists for the run.
+- Clears **only** the short-term conversation — **durable per-user memory
+  (`memory.py`) is untouched**. It's "forget what we were just saying," not
+  "forget who you are." Height overrides (`molly_heights`) are left alone too.
+- The confirmation is an **ephemeral** in-character reply (only the runner sees
+  it), so resetting doesn't post a notice into the channel for everyone.
+
 ### Persistent per-user memory (`memory.py`)
 
 Durable facts Molly knows about individual people, surviving restarts. Backed by
@@ -164,6 +193,36 @@ down, like GIFs without `KLIPY_API_KEY`. `memory.init()` is called from
   (the "YOUR MEMORY OF PEOPLE" section) **and** the caps in `memory.py` — tune
   together, same as reactions/GIFs.
 
+### Private threads (`[thread:]` / `[invite:]`)
+
+Molly can take someone into a **private** thread off the home channel and bring
+people in. Driven by tags she emits (prompt section "TAKING SOMEONE ASIDE"),
+resolved/performed by `process_thread_ops` at the end of `deliver_reply` (after
+the visible reply, errors swallowed — same fire-and-forget pattern as
+`process_memory_ops`).
+
+- **Triggers**: someone asks to "talk in private" / "make a thread" → `[thread:
+  title]`. The owner saying "make a thread with me and Bob" → `[thread: title |
+  Bob]` (extras after the pipe). Inside a thread, "can you add Bob" → `[invite:
+  Bob]`.
+- **Who gets added, in order**: the **owner always first** (the `HEIGHT_CONTROLLER`
+  handle, via `resolve_owner_member`, cached per guild), then the **requester**
+  (the current human speaker — `memory_subject`, i.e. `message.author`), then any
+  named extras. De-duped, so the owner-requests-own-thread case doesn't double-add.
+- **Creation is restricted to the home channel** (`message.channel.id ==
+  CHANNEL_ID`): threads can't nest, and a thread under home counts as home
+  (`is_home_channel` via `parent_id`) so she talks freely in it with no ping.
+  Per-channel `THREAD_COOLDOWN_SECONDS` floor so it can't be spam-summoned.
+- **Context carry-over** is backend-only (no synopsis posted): `seed_thread_context`
+  copies the parent channel's history deque + recent-speakers window into the new
+  thread and marks it primed, so she continues exactly where she was and stored
+  memory still loads. Durable per-user memory follows her anyway (keyed by user_id).
+- **Name resolution** (`resolve_invitee`) is deliberately robust: real @mentions in
+  the message → recent speakers in the channel → guild-member search (exact, then a
+  single unambiguous partial). Unknown/ambiguous names are skipped, not guessed.
+- Private threads need **Create Private Threads** + **Send Messages in Threads**;
+  `add_user` works because the bot is the thread's creator.
+
 ### Inline action tags (the key convention)
 
 Molly emits private tags in her reply text; `parse_actions` strips them out
@@ -177,6 +236,9 @@ Molly emits private tags in her reply text; `parse_actions` strips them out
 - `[remember: fact]` / `[remember: Name | fact]` — save a durable per-user fact;
   `[forget: keyword]` / `[forget: Name | keyword]` — drop matching facts. See the
   persistent-memory section above.
+- `[thread: title]` / `[thread: title | Name1, Name2]` — open a **private** thread
+  off the home channel; `[invite: Name]` — add people to the thread she's already
+  in. See the private-threads section below.
 - `:custom_name:` in body text — replaced with real `<:name:id>` markup for the
   server's custom emoji (these *do* render in chat; unknown names stay as text).
 

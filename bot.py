@@ -13,9 +13,11 @@ import random
 import re
 import time
 from collections import OrderedDict, deque
+from datetime import datetime
 
 import aiohttp
 import discord
+from discord import app_commands
 from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
 
@@ -50,6 +52,10 @@ GIF_RATING = "pg-13"  # Klipy content rating: g < pg < pg-13 < r; this excludes 
 # Floor between Molly reacting to emoji-reactions on her own messages, per channel,
 # so a message getting reaction-spammed doesn't make her spam back.
 REACTION_REPLY_COOLDOWN = 45
+# Floor between Molly opening private threads in a channel, so "make a thread" can't
+# be spam-summoned (every thread also pings the owner, so this matters).
+THREAD_COOLDOWN_SECONDS = 30
+THREAD_NAME_MAX = 90  # Discord caps thread names at 100; leave margin
 # How many server emoji/sticker names to list in the prompt, to bound token use.
 MAX_PROMPT_EMOJIS = 60
 MAX_PROMPT_STICKERS = 30
@@ -65,6 +71,12 @@ STICKER_TAG_RE = re.compile(r"\[sticker:\s*([^\]]+?)\s*\]", re.IGNORECASE)
 # in the room. "[forget: ...]" drops matching facts the same way.
 REMEMBER_TAG_RE = re.compile(r"\[remember:\s*([^\]]+?)\s*\]", re.IGNORECASE)
 FORGET_TAG_RE = re.compile(r"\[forget:\s*([^\]]+?)\s*\]", re.IGNORECASE)
+# Private-thread tags. "[thread: title]" opens a private thread off her channel
+# (owner + requester are pulled in automatically); "[thread: title | Bob, Carol]"
+# also invites the named people. "[invite: Bob]" adds people to the thread she's
+# already in. Names are resolved leniently (see resolve_invitee).
+THREAD_TAG_RE = re.compile(r"\[thread:\s*([^\]]+?)\s*\]", re.IGNORECASE)
+INVITE_TAG_RE = re.compile(r"\[invite:\s*([^\]]+?)\s*\]", re.IGNORECASE)
 EMOJI_SHORTCODE_RE = re.compile(r":([a-zA-Z0-9_]{2,32}):")
 # Custom emoji as they appear in raw message content: <:name:id> / <a:name:id>.
 CUSTOM_EMOJI_RE = re.compile(r"<(a)?:(\w+):(\d+)>")
@@ -97,6 +109,9 @@ anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 _http_session: aiohttp.ClientSession | None = None
 # Per-channel timestamp (monotonic) of the last GIF, for the cooldown above.
 last_gif_at: dict[int, float] = {}
+# Per-channel timestamp (monotonic) of the last private thread Molly opened, for
+# the THREAD_COOLDOWN_SECONDS floor.
+last_thread_at: dict[int, float] = {}
 # Per-channel current height (cm) set by Zamalko's control command. Held in
 # memory only and NEVER written to history, so it colours how Molly acts in the
 # moment without becoming something she "remembers" or repeats. Resets on
@@ -112,6 +127,11 @@ last_reaction_reply_at: dict[int, float] = {}
 histories: dict[int, deque] = {}
 # Channels whose history has been primed from Discord at least once this run.
 primed_channels: set[int] = set()
+# Per-channel "fresh start" line set by /mollynewchat: Molly ignores everything in
+# that channel from before this timestamp. Clearing her live history isn't enough
+# on its own — context priming would just backfill the old messages again — so
+# prime_channel_context also drops anything at or before this boundary.
+fresh_start_at: dict[int, datetime] = {}
 # One lock per channel so messages are handled strictly one at a time there —
 # concurrent handlers would otherwise interleave on the shared history deque and
 # cross-contaminate replies (answering two people as if they were the same one).
@@ -126,6 +146,9 @@ recent_speakers: dict[int, "OrderedDict[int, str]"] = {}
 # Cache of (guild_id, user_id) -> per-server display name, so resolving the
 # nickname for a backfilled author costs at most one REST fetch per person.
 nick_cache: dict[tuple[int, int], str] = {}
+# Cache of guild_id -> the owner's user id (the HEIGHT_CONTROLLER handle), so we
+# don't rescan the member list every time a private thread needs the owner added.
+owner_member_cache: dict[int, int] = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -135,6 +158,9 @@ intents.message_content = True
 # Must also be enabled in the Discord Developer Portal or the bot won't start.
 intents.members = True
 client = discord.Client(intents=intents)
+# Slash commands hang off a command tree. We only ever sync it to Molly's own
+# guild (in on_ready), so the commands appear in that server and nowhere else.
+tree = app_commands.CommandTree(client)
 
 
 def get_history(channel_id: int) -> deque:
@@ -176,15 +202,21 @@ def build_request_messages(history: deque) -> list[dict]:
 
 def parse_actions(
     reply_text: str,
-) -> tuple[str, list[str], str | None, list[str], list[str], list[str]]:
+) -> tuple[
+    str, list[str], str | None, list[str], list[str], list[str],
+    tuple[str, list[str]] | None, list[str],
+]:
     """Pull Molly's inline action tags out of her reply.
 
-    Returns (clean_text, reactions, gif_query, sticker_names, remembers,
-    forgets): the message the users actually see, up to MAX_REACTIONS emoji to
-    react with, an optional GIF search query (the last [gif:...] tag wins if she
-    emits more than one), up to MAX_STICKERS server-sticker names to attach, and
-    the raw bodies of any [remember:...] / [forget:...] memory tags (resolved to
-    a target user and persisted later, by process_memory_ops).
+    Returns (clean_text, reactions, gif_query, sticker_names, remembers, forgets,
+    thread_request, invites): the message the users actually see, up to
+    MAX_REACTIONS emoji to react with, an optional GIF search query (the last
+    [gif:...] tag wins if she emits more than one), up to MAX_STICKERS
+    server-sticker names to attach, the raw bodies of any [remember:...] /
+    [forget:...] memory tags, an optional (title, [extra invitee names]) private
+    thread to open (the first [thread:...] tag wins), and any [invite:...] names
+    to add to the current thread. Threads/invites are resolved and performed
+    later by process_thread_ops.
     """
     reactions = [m.strip() for m in REACT_TAG_RE.findall(reply_text)][:MAX_REACTIONS]
     gif_matches = GIF_TAG_RE.findall(reply_text)
@@ -193,10 +225,33 @@ def parse_actions(
     remembers = [m.strip() for m in REMEMBER_TAG_RE.findall(reply_text)]
     forgets = [m.strip() for m in FORGET_TAG_RE.findall(reply_text)]
 
-    clean_text = FORGET_TAG_RE.sub(
+    # First [thread:...] wins. Body is "title" or "title | name1, name2" — the
+    # part after the pipe is extra people to invite beyond owner + requester.
+    thread_request: tuple[str, list[str]] | None = None
+    thread_matches = THREAD_TAG_RE.findall(reply_text)
+    if thread_matches:
+        body = thread_matches[0].strip()
+        title, _, names_part = body.partition("|")
+        extra = [n.strip() for n in re.split(r"[;,]", names_part) if n.strip()]
+        thread_request = (title.strip(), extra)
+    # Every [invite:...] adds its (comma/semicolon-separated) names to the thread.
+    invites: list[str] = []
+    for body in INVITE_TAG_RE.findall(reply_text):
+        invites.extend(n.strip() for n in re.split(r"[;,]", body) if n.strip())
+
+    clean_text = INVITE_TAG_RE.sub(
         "",
-        REMEMBER_TAG_RE.sub(
-            "", STICKER_TAG_RE.sub("", GIF_TAG_RE.sub("", REACT_TAG_RE.sub("", reply_text)))
+        THREAD_TAG_RE.sub(
+            "",
+            FORGET_TAG_RE.sub(
+                "",
+                REMEMBER_TAG_RE.sub(
+                    "",
+                    STICKER_TAG_RE.sub(
+                        "", GIF_TAG_RE.sub("", REACT_TAG_RE.sub("", reply_text))
+                    ),
+                ),
+            ),
         ),
     )
     # Pulling a tag from mid-sentence can leave a double space; collapse runs of
@@ -208,7 +263,10 @@ def parse_actions(
     # gap in Discord. A run of newlines (with any blank-line whitespace between)
     # becomes one newline; deliberate single line breaks are left alone.
     clean_text = re.sub(r"\n[ \t]*(?:\n[ \t]*)+", "\n", clean_text).strip()
-    return clean_text, reactions, gif_query, sticker_names, remembers, forgets
+    return (
+        clean_text, reactions, gif_query, sticker_names, remembers, forgets,
+        thread_request, invites,
+    )
 
 
 def _first_gif_url(media: object) -> str | None:
@@ -515,6 +573,191 @@ async def process_memory_ops(
             await memory.forget(guild.id, uid, needle)
 
 
+def resolve_owner_member(guild: discord.Guild) -> "discord.Member | None":
+    """The guild member whose handle is HEIGHT_CONTROLLER (the owner), or None.
+
+    Every private thread must have the owner in it first, so we look them up by
+    their globally-unique handle and cache the resulting user id per guild. Needs
+    the members intent (on) so guild.members is populated; returns None if the
+    owner isn't in this guild / isn't cached yet (we then just skip adding them).
+    """
+    uid = owner_member_cache.get(guild.id)
+    if uid is not None:
+        member = guild.get_member(uid)
+        if member is not None:
+            return member
+    for member in guild.members:
+        if member.name.lower() == HEIGHT_CONTROLLER:
+            owner_member_cache[guild.id] = member.id
+            return member
+    return None
+
+
+async def resolve_invitee(
+    guild: discord.Guild, message: discord.Message, name: str
+) -> "discord.Member | None":
+    """Best-effort resolve a name Molly wants to invite to a real guild member.
+
+    Robust by design — tries, in order: (1) an actual @mention in the triggering
+    message that matches the name (most reliable, since the human pointed at them),
+    (2) someone who's recently spoken in this channel, (3) a guild-member search by
+    nick / display name / global name / handle, preferring an exact match and only
+    accepting a partial one if it's unambiguous. Anything unknown or ambiguous
+    returns None so we skip rather than invite the wrong person.
+    """
+    wanted = name.lstrip("@").strip().lower()
+    if not wanted:
+        return None
+
+    def labels_of(m) -> list[str]:
+        return [
+            (getattr(m, "nick", None) or "").lower(),
+            (getattr(m, "display_name", "") or "").lower(),
+            (getattr(m, "global_name", None) or "").lower(),
+            (getattr(m, "name", "") or "").lower(),
+        ]
+
+    # 1) The human actually @mentioned someone — match the name against them.
+    for user in message.mentions:
+        labels = labels_of(user)
+        if any(lbl == wanted for lbl in labels) or any(
+            lbl and wanted in lbl for lbl in labels
+        ):
+            member = guild.get_member(user.id)
+            if member is not None:
+                return member
+
+    # 2) Someone who's recently spoken here (label we showed Molly == the name).
+    for uid, label in recent_speakers.get(message.channel.id, {}).items():
+        if label.lower() == wanted:
+            member = guild.get_member(uid)
+            if member is not None:
+                return member
+
+    # 3) Search the guild: exact match first, then a single unambiguous partial.
+    exact: list[discord.Member] = []
+    partial: list[discord.Member] = []
+    for member in guild.members:
+        if member.bot:
+            continue
+        labels = labels_of(member)
+        if any(lbl == wanted for lbl in labels):
+            exact.append(member)
+        elif any(lbl and wanted in lbl for lbl in labels):
+            partial.append(member)
+    if len(exact) == 1:
+        return exact[0]
+    if not exact and len(partial) == 1:
+        return partial[0]
+    return None
+
+
+def seed_thread_context(parent_id: int, thread_id: int) -> None:
+    """Copy a channel's recent conversation into a freshly-made thread.
+
+    So Molly carries on in the thread exactly where she left off — backend only,
+    nothing is posted. Copies the history deque and the recent-speakers window
+    (so stored memory still loads), and marks the thread primed so context
+    backfill doesn't run against the empty thread.
+    """
+    parent_hist = histories.get(parent_id)
+    if parent_hist:
+        get_history(thread_id).extend(list(parent_hist))
+    parent_speakers = recent_speakers.get(parent_id)
+    if parent_speakers:
+        recent_speakers[thread_id] = OrderedDict(parent_speakers)
+    primed_channels.add(thread_id)
+
+
+async def process_thread_ops(
+    message: discord.Message,
+    requester,
+    thread_request: "tuple[str, list[str]] | None",
+    invites: list[str],
+) -> None:
+    """Open private threads / add people, from Molly's [thread:]/[invite:] tags.
+
+    Runs after the visible reply is sent and swallows its own errors, so a Discord
+    hiccup can never break the message — same spirit as process_memory_ops.
+
+    - [invite: name] adds people to the CURRENT thread (only meaningful when this
+      message is already in a thread).
+    - [thread: title | names] opens a PRIVATE thread off the home channel and
+      pulls people in, ALWAYS in this order: the owner first, then the requester
+      (the person Molly's replying to), then any explicitly-named extras. That
+      covers both "can we talk in private" (owner + requester) and the owner's
+      "make a thread with me and Bob" (owner + Bob). Capped by a per-channel
+      cooldown. The new thread is seeded with the channel's recent context.
+    """
+    guild = message.guild
+    if guild is None:
+        return
+
+    # Add people to the thread Molly is already in.
+    if invites and isinstance(message.channel, discord.Thread):
+        for name in invites:
+            member = await resolve_invitee(guild, message, name)
+            if member is None:
+                continue
+            try:
+                await message.channel.add_user(member)
+            except Exception as exc:  # noqa: BLE001 — one bad invite mustn't break others
+                print(f"[thread] invite {name!r} failed: {exc}")
+
+    if thread_request is None:
+        return
+    # Only open threads off the home channel (can't nest threads, and that's where
+    # she lives) — a thread there counts as home so she'll talk freely in it.
+    if message.channel.id != CHANNEL_ID or not isinstance(
+        message.channel, discord.TextChannel
+    ):
+        return
+    now = time.monotonic()
+    if now - last_thread_at.get(message.channel.id, 0.0) < THREAD_COOLDOWN_SECONDS:
+        return
+
+    title, extra_names = thread_request
+    title = (title or "molly chat")[:THREAD_NAME_MAX]
+    try:
+        thread = await message.channel.create_thread(
+            name=title,
+            type=discord.ChannelType.private_thread,
+            invitable=False,
+        )
+    except Exception as exc:  # noqa: BLE001 — never let a failed create break the reply
+        print(f"[thread] create failed: {exc}")
+        return
+    last_thread_at[message.channel.id] = now
+
+    # Build the invite list in the required order, de-duped: owner, requester, extras.
+    ordered: list = []
+    seen: set[int] = set()
+
+    def add(member) -> None:
+        if member is not None and getattr(member, "id", None) not in seen:
+            seen.add(member.id)
+            ordered.append(member)
+
+    owner = resolve_owner_member(guild)
+    if owner is None:
+        print("[thread] owner not found in guild — creating thread without them")
+    add(owner)
+    add(requester)
+    for name in extra_names:
+        add(await resolve_invitee(guild, message, name))
+
+    # Carry her recent context into the thread so she continues seamlessly.
+    seed_thread_context(message.channel.id, thread.id)
+
+    # Add everyone (owner first). add_user on a private thread works because the
+    # bot is the thread's creator; per-user failures are non-fatal.
+    for member in ordered:
+        try:
+            await thread.add_user(member)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[thread] add {member} failed: {exc}")
+
+
 def collect_images(message: discord.Message) -> tuple[list[dict], list[str]]:
     """Gather viewable images from a message for Claude's vision.
 
@@ -660,8 +903,13 @@ async def prime_channel_context(
     # Resolve each human author's nickname (with the REST fallback) so backfilled
     # turns are labelled exactly like live ones, and note them as recent speakers
     # so their stored memory is available the moment Molly is dropped back in.
+    # Anything at or before a /mollynewchat boundary is skipped so a reset can't be
+    # undone by backfill — she genuinely never sees what was said before the line.
+    boundary = fresh_start_at.get(channel.id)
     turns: list[dict] = []
     for msg in reversed(recent):
+        if boundary is not None and msg.created_at <= boundary:
+            continue
         name = None
         if not msg.author.bot:
             name = await resolve_member_name(msg.guild, msg.author)
@@ -698,11 +946,61 @@ async def replied_to_author_id(message: discord.Message) -> int | None:
     return original.author.id
 
 
+@tree.command(
+    name="mollynewchat",
+    description="Wipe Molly's short-term memory of this channel so she starts fresh.",
+)
+async def mollynewchat(interaction: discord.Interaction) -> None:
+    """Owner-only reset of a channel's short-term conversation.
+
+    Clears the live history deque AND drops a fresh-start boundary so context
+    priming won't backfill the old messages — from here she only sees what's said
+    after this point. Her *durable* per-user memory (memory.py / MySQL) is left
+    untouched: this forgets the conversation, not who people are.
+
+    Gated to the same controller handle as the height command (globally unique,
+    unspoofable). The reply is ephemeral, so only the runner sees it and the
+    channel isn't spammed with a reset notice.
+    """
+    if interaction.user.name.lower() != HEIGHT_CONTROLLER:
+        await interaction.response.send_message(
+            "nah, only my person gets to do that one :p", ephemeral=True
+        )
+        return
+    channel_id = interaction.channel_id
+    if channel_id is not None:
+        histories.pop(channel_id, None)
+        recent_speakers.pop(channel_id, None)
+        fresh_start_at[channel_id] = interaction.created_at
+        # Mark primed so the home channel doesn't re-seed from before the line;
+        # non-home channels re-prime but the boundary filters the old messages.
+        primed_channels.add(channel_id)
+    await interaction.response.send_message(
+        "aight, clean slate :3 i don't remember anything we were just talking "
+        "about — what's up?",
+        ephemeral=True,
+    )
+
+
 @client.event
 async def on_ready() -> None:
     # Bring up persistent memory (idempotent — on_ready can fire on reconnects).
     # If MySQL isn't configured/reachable it just stays off and the bot runs on.
     await memory.init()
+    # Register the slash command on Molly's own guild only (instant, and it won't
+    # show up in any other server). Derived from the home channel so there's no
+    # extra GUILD_ID to configure. Best-effort: a sync failure must not stop her.
+    try:
+        home = client.get_channel(CHANNEL_ID)
+        guild = getattr(home, "guild", None)
+        if guild is not None:
+            tree.copy_global_to(guild=guild)
+            await tree.sync(guild=guild)
+            print(f"[slash] /mollynewchat synced to {guild.name}")
+        else:
+            print("[slash] home channel's guild not found — slash command not synced")
+    except Exception as exc:  # noqa: BLE001 — slash sync must not crash startup
+        print(f"[slash] command sync failed: {exc}")
     print(f"Logged in as {client.user} — listening in channel {CHANNEL_ID}")
 
 
@@ -925,9 +1223,10 @@ async def deliver_reply(
     placeholder when she only reacted/giffed/stickered — for the caller to record
     (or ignore).
     """
-    clean_text, reactions, gif_query, sticker_names, remembers, forgets = parse_actions(
-        reply_text
-    )
+    (
+        clean_text, reactions, gif_query, sticker_names, remembers, forgets,
+        thread_request, invites,
+    ) = parse_actions(reply_text)
     guild = message.guild
 
     # Turn :name: shortcodes into real markup for this server's custom emoji.
@@ -988,6 +1287,11 @@ async def deliver_reply(
             await message.channel.send(gif_url)
         else:
             await message.reply(gif_url)
+
+    # Private-thread actions, after the visible reply. The requester (who gets
+    # pulled in after the owner) is the current human speaker — memory_subject —
+    # which is message.author in the normal path. Swallows its own errors.
+    await process_thread_ops(message, memory_subject, thread_request, invites)
 
     # Persist any memory tags last, so a slow/failed DB write can never hold up
     # or break the visible reply (process_memory_ops also swallows its own errors).
