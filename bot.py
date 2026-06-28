@@ -661,12 +661,14 @@ def seed_thread_context(parent_id: int, thread_id: int) -> None:
     backfill doesn't run against the empty thread.
     """
     parent_hist = histories.get(parent_id)
+    target = get_history(thread_id)
     if parent_hist:
-        get_history(thread_id).extend(list(parent_hist))
+        target.extend(list(parent_hist))
     parent_speakers = recent_speakers.get(parent_id)
     if parent_speakers:
         recent_speakers[thread_id] = OrderedDict(parent_speakers)
     primed_channels.add(thread_id)
+    print(f"[thread] seeded {len(target)} turns of context into thread {thread_id}")
 
 
 async def post_thread_opener(thread: discord.Thread, requester, invited_names: list[str]) -> None:
@@ -683,10 +685,14 @@ async def post_thread_opener(thread: discord.Thread, requester, invited_names: l
     who = ", ".join(n for n in invited_names if n) or "them"
     cue = (
         f"(You just brought {who} into a private thread, away from the main channel, "
-        "because that was asked for. You're the first one here — open it with a warm, "
-        "in-character line or two that picks up naturally right where you all just "
-        "were, like walking into a quieter room together and carrying on. Keep it "
-        "short and real — NOT a recap, a summary, or a list of what you remember.)"
+        "because that was asked for. The conversation you were ALL just having is "
+        "right above this — KEEP IT GOING in here, seamlessly, like you all just "
+        "stepped into a quieter room mid-chat and carried straight on. Pick up the "
+        "actual thing you were just talking about: react to it, answer the last thing "
+        "that was said, move it forward. Do NOT restart from scratch with a blank "
+        "'heyy what's up', and do NOT summarise, recap, or list what you remember — "
+        "just naturally keep talking like no break happened. If they clearly pulled "
+        "you in here to bring up something new, give them the space to. A line or two.)"
     )
     history.append({"role": "user", "content": cue})
     try:
