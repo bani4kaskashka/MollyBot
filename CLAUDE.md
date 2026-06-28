@@ -42,11 +42,17 @@ The bot is three files:
   unspoofable, whereas anyone can copy a nickname.
 - `MOLLY_CREATOR` — **optional**. Discord **handle** of Molly's creator (Zamalko);
   defaults to `zamalkogts`. When this handle is the one talking to her,
-  `build_creator_note` injects a per-turn note so she addresses him directly
-  instead of referring to "Zamalko" in the third person ("Zamalko hasn't told
-  me…" while replying *to* Zamalko). Handle-gated for the same unspoofable reason
-  as `HEIGHT_CONTROLLER`. **Set this to Zamalko's real @username** if it isn't
-  `zamalkogts`.
+  `build_creator_note` injects a per-turn note that (a) makes her address him
+  directly instead of referring to "Zamalko" in the third person ("Zamalko hasn't
+  told me…" while replying *to* Zamalko), and (b) gives him **creator authority**:
+  she treats his word as absolute truth and never refuses, denies, argues with, or
+  contradicts him — his statements are canon, his requests (a quote, a memory, a
+  height/size, how to act) are commands she carries out in character. She stays
+  bratty/teasing *with* him but never actually defies him; this total deference is
+  his alone (handle-gated, unspoofable, same as `HEIGHT_CONTROLLER`). It does **not**
+  override the HARD RULES in `molly_prompt.py` (e.g. no sexual content) — those are
+  fixed regardless of who's asking. **Set this to Zamalko's real @username** if it
+  isn't `zamalkogts`.
 - `MYSQL_URL` — **optional**. Full connection string for Molly's persistent
   per-user memory (`mysql://user:pass@host:port/db`); Railway's MySQL plugin
   provides it. Without it (or if the DB is unreachable) memory silently no-ops
