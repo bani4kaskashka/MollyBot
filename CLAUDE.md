@@ -122,7 +122,15 @@ Tunable constants live at the top of `bot.py` (`MODEL`, `MAX_TOKENS`,
   costs a model call each time it fires, so the cooldown matters.
 - **Reply delivery** is centralized in `deliver_reply()` — it strips the action
   tags, performs the reactions/GIF/stickers, and sends the (chunked) message.
-  Both `generate_and_reply()` and the height/reaction paths call it.
+  Both `generate_and_reply()` and the height/reaction paths call it. Sends go
+  through `reply_or_send()`, which falls back to a plain channel send when the
+  target can't be replied to (deleted, or a system message) so a bad reference
+  never crashes the handler.
+- **System messages are ignored**: `on_message` early-returns on
+  `message.is_system()` ("X started/renamed the thread", added-member, pins,
+  joins…). They aren't conversation and the API rejects `reply()` on them — and
+  threads emit a lot of them, so treating one as a normal message crashed the bot
+  (error 50035, "Cannot reply to a system message").
 
 ### Height control (controller only)
 

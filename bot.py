@@ -1090,6 +1090,13 @@ async def on_message(message: discord.Message) -> None:
     if message.author.bot:
         return
 
+    # Ignore Discord's own system notices — "X started/renamed the thread", "X was
+    # added", pins, joins, etc. They aren't conversation, and they can't even be
+    # replied to (the API rejects message.reply on a system message), so treating
+    # one as a normal message would crash the handler. Threads emit a lot of these.
+    if message.is_system():
+        return
+
     # Zamalko's height control. Checked before the home-channel/mention gate so
     # it works wherever he posts it — but ONLY from his exact account and ONLY
     # when the message is just the bare "$ set_molly_height_cm(N)" command.
@@ -1276,6 +1283,19 @@ async def generate_and_reply(
     history.append({"role": "assistant", "content": history_note})
 
 
+async def reply_or_send(message: discord.Message, content: str | None = None, **kwargs):
+    """Reply to `message`, falling back to a plain channel send if that's not
+    possible. Replying fails (HTTP 400) when the target can't be referenced — a
+    deleted message, or a system message that slipped through — and we never want
+    that to crash a reply, so we just send into the channel without the reference.
+    """
+    try:
+        return await message.reply(content, **kwargs)
+    except discord.HTTPException as exc:
+        print(f"reply failed ({exc}); sending without reference")
+        return await message.channel.send(content, **kwargs)
+
+
 async def deliver_reply(
     message: discord.Message, reply_text: str, *, memory_subject=None
 ) -> str:
@@ -1339,19 +1359,19 @@ async def deliver_reply(
             clean_text[i:i + DISCORD_MAX_LEN]
             for i in range(0, len(clean_text), DISCORD_MAX_LEN)
         ]
-        await message.reply(chunks[0], **sticker_kwargs)
+        await reply_or_send(message, chunks[0], **sticker_kwargs)
         for chunk in chunks[1:]:
             await message.channel.send(chunk)
         sent = True
     elif stickers:
-        await message.reply(**sticker_kwargs)
+        await reply_or_send(message, **sticker_kwargs)
         sent = True
 
     if gif_url:
         if sent:
             await message.channel.send(gif_url)
         else:
-            await message.reply(gif_url)
+            await reply_or_send(message, gif_url)
 
     # Private-thread actions, after the visible reply. The requester (who gets
     # pulled in after the owner) is the current human speaker — memory_subject —
