@@ -280,3 +280,26 @@ governed by the prompt wording in `molly_prompt.py` **and** the hard caps in
   engages once that prefix clears the model minimum (~4096 tokens on Haiku 4.5),
   otherwise it harmlessly no-ops. `HISTORY_LIMIT` is the other main spend lever —
   the whole window is re-sent as input every message.
+
+## Ideas / not yet built
+
+Maintainer suggestions parked here for later — **not implemented**.
+
+- **Patreon → announcement channel.** Have Molly post the maintainer's new Patreon
+  releases (in character) to a dedicated announcements channel. Sketch from
+  discussion:
+  - *How she'd learn about a post* — three options: **RSS polling** (background
+    timer checks the Patreon feed every few minutes; lives inside the bot, no extra
+    service; needs the feed URL + token for patron-only posts, and a stored
+    last-announced post id — reuse MySQL — so it never double-posts or re-spams old
+    ones on restart); **webhooks** (instant, but needs a public HTTP endpoint stood
+    up — real extra plumbing since the bot is a gateway client, not a web server);
+    or **manual/you-trigger** (maintainer drops the link or runs a command and she
+    reposts it — trivial, works today, pairs with the creator-authority note).
+  - Leaning: ship **manual** first, add **RSS polling** for the hands-off version;
+    skip webhooks unless instant-to-the-second is needed.
+  - Open decisions: auto vs manual vs both; bare link vs in-character hype text;
+    whether to ping (`@everyone` / a `@Patrons` role / no ping); public posts only
+    vs patron-locked too (announce the "it's up" link, content stays gated).
+  - Would add an `ANNOUNCEMENT_CHANNEL_ID` env var so she posts there only for this
+    and doesn't start chatting in the announcements channel.
