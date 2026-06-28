@@ -530,7 +530,21 @@ def build_personality_note(guild: "discord.Guild | None", author) -> str:
     cfg = PERSONALITIES.get(key)
     if not cfg:
         return ""
-    return "\n\n" + cfg["note"]
+    # Name the target and guard against bleed: history is shared across the whole
+    # channel, so Molly's own recent styled replies (to whoever set a mode) sit in
+    # the transcript she's re-sent each turn. Without this she copies that tone for
+    # everyone — and keeps it after a /resetpersonality until the messages roll off.
+    name = getattr(author, "display_name", None) or "the person you're replying to"
+    return (
+        f"\n\nPERSONALITY MODE — applies to {name} ONLY: {name} (who you're "
+        "replying to right now) asked you to act a certain way with them. This is "
+        f"about how you treat {name} specifically — NOT a mood for the whole room. "
+        "Everyone else still gets normal Molly. Your own earlier messages in the "
+        "log above may be in a mode you're using for someone else (or one that's "
+        "since been switched off); do NOT copy that tone just because it's there — "
+        "judge every single reply purely by who you're answering at that moment.\n"
+        + cfg["note"]
+    )
 
 
 def build_system_blocks(

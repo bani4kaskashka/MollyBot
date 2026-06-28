@@ -215,6 +215,25 @@ one person setting a mode can't change how she treats anyone else.
   anything the model would refuse).
 - Both confirmations are **ephemeral** in-character replies, so picking a vibe
   doesn't spam the channel.
+- **Bleed mitigation (prompt-only — revertible).** Short-term history is shared
+  per channel (see "Short-term history"), so Molly's own styled replies (to
+  whoever set a mode) sit in the transcript that's re-sent every turn and
+  re-primed by context backfill. On a small model that makes the tone **bleed
+  onto other speakers**, and **linger after `/resetpersonality`** until the
+  messages roll off `HISTORY_LIMIT`. Two prompt-level guards counter this: (1)
+  `build_personality_note` **names the target** ("applies to `<name>` ONLY…")
+  and tells her not to copy a tone out of the log; (2) a matching general rule in
+  `molly_prompt.py` (under "THE CHANNEL — WHO YOU'RE TALKING TO") says who she's
+  replying to *right now* decides her tone, not the transcript. This is a
+  **mitigation, not a guarantee** — she can still occasionally drift since she
+  literally sees her past styled lines. **To revert** the guards, drop the
+  name/anti-bleed wrapper in `build_personality_note` (back to `return "\n\n" +
+  cfg["note"]`) and remove that base-prompt bullet. **Stronger options if it's
+  still leaky:** lower `HISTORY_LIMIT` so styled lines roll off faster (quicker
+  reset recovery, shorter memory); tag stored assistant turns with whose mode
+  they were and filter per request (robust, more involved); or make personality
+  **per-channel** instead of per-user (kills bleed entirely, but a different
+  feature than "how she talks to *me*").
 
 ### Persistent per-user memory (`memory.py`)
 
