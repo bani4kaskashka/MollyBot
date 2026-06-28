@@ -77,7 +77,10 @@ Tunable constants live at the top of `bot.py` (`MODEL`, `MAX_TOKENS`,
 
 - **Where she talks**: in the **home channel** (`CHANNEL_ID`) she replies to every
   message; in any other channel she only replies when explicitly @-mentioned
-  (`@everyone`/`@here` don't count). **Exception**: even at home she stays out of a
+  (`@everyone`/`@here` don't count). A **thread inside the home channel counts as
+  home** — `is_home_channel()` matches the channel id *or* a thread whose
+  `parent_id` is `CHANNEL_ID` (threads have their own id, so without this she'd
+  treat them as mention-only). **Exception**: even at home she stays out of a
   Discord *reply* aimed at another person (two people talking to each other),
   unless she's actually pinged — `replied_to_author_id()` checks the reply target;
   a reply to herself or to Molly still gets an answer.

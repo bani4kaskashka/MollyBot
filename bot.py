@@ -1,7 +1,8 @@
 """MollyBot — a Discord bot that replies in character as Molly Simpson.
 
-In her home channel (CHANNEL_ID) Molly replies to every message; in any other
-channel she only responds when she is @-mentioned. History is kept per channel
+In her home channel (CHANNEL_ID) — and any thread inside it — Molly replies to
+every message; in any other channel she only responds when she is @-mentioned.
+History is kept per channel
 (each human turn tagged with the speaker's name so she can tell people apart),
 and replies are generated with the Anthropic API.
 """
@@ -705,6 +706,21 @@ async def on_ready() -> None:
     print(f"Logged in as {client.user} — listening in channel {CHANNEL_ID}")
 
 
+def is_home_channel(channel) -> bool:
+    """True for Molly's home channel AND any thread that lives inside it.
+
+    A Discord thread has its own channel id (with parent_id pointing back to the
+    channel it was created in), so a thread under the home channel would
+    otherwise look like a foreign channel and she'd only answer when @-mentioned.
+    Matching on parent_id lets her talk freely in threads off her channel, same
+    as in the channel itself. getattr keeps it safe for channel types that have
+    no parent_id (regular text channels return None and just fall through).
+    """
+    if channel.id == CHANNEL_ID:
+        return True
+    return getattr(channel, "parent_id", None) == CHANNEL_ID
+
+
 @client.event
 async def on_message(message: discord.Message) -> None:
     # Never respond to ourselves or any other bot.
@@ -724,7 +740,7 @@ async def on_message(message: discord.Message) -> None:
     # Is Molly explicitly @-mentioned here? A direct ping or a reply-with-ping to
     # her both land in message.mentions; @everyone/@here deliberately do NOT, so
     # she isn't dragged into mass pings.
-    is_home = message.channel.id == CHANNEL_ID
+    is_home = is_home_channel(message.channel)
     mentioned = client.user is not None and any(
         user.id == client.user.id for user in message.mentions
     )
@@ -825,7 +841,7 @@ async def generate_and_reply(
     # home channel is primed once (she then sees everything live); other channels
     # — where she's only present when @-mentioned — are re-primed every time so
     # she catches up on whatever was said while she was away.
-    is_home = message.channel.id == CHANNEL_ID
+    is_home = is_home_channel(message.channel)
     if not is_home or message.channel.id not in primed_channels:
         await prime_channel_context(message.channel, history, before=message)
         primed_channels.add(message.channel.id)
@@ -1001,7 +1017,7 @@ async def apply_height_shift(message: discord.Message, height: int) -> None:
 
     # Catch up on the room so her reaction fits the conversation, exactly like a
     # normal turn (home channel primed once, other channels every time).
-    is_home = channel_id == CHANNEL_ID
+    is_home = is_home_channel(message.channel)
     if not is_home or channel_id not in primed_channels:
         await prime_channel_context(message.channel, history, before=message)
         primed_channels.add(channel_id)
