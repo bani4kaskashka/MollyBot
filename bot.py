@@ -669,6 +669,59 @@ def seed_thread_context(parent_id: int, thread_id: int) -> None:
     primed_channels.add(thread_id)
 
 
+async def post_thread_opener(thread: discord.Thread, requester, invited_names: list[str]) -> None:
+    """Have Molly post the first line in a freshly-opened private thread.
+
+    The thread starts empty and she only speaks when spoken to, so without this it
+    just sits silent after creation. One model call — fed the context we already
+    seeded into the thread — produces a warm, in-character opener that picks up
+    where the conversation was, like leading someone into a quieter room. It is
+    NOT a memory dump or a recap list. Best-effort: a failure just leaves the
+    thread empty, no worse than before, and never disturbs the main reply.
+    """
+    history = get_history(thread.id)
+    who = ", ".join(n for n in invited_names if n) or "them"
+    cue = (
+        f"(You just brought {who} into a private thread, away from the main channel, "
+        "because that was asked for. You're the first one here — open it with a warm, "
+        "in-character line or two that picks up naturally right where you all just "
+        "were, like walking into a quieter room together and carrying on. Keep it "
+        "short and real — NOT a recap, a summary, or a list of what you remember.)"
+    )
+    history.append({"role": "user", "content": cue})
+    try:
+        request_messages = build_request_messages(history)
+        system_prompt = build_system_blocks(
+            thread.guild,
+            thread.id,
+            await build_memory_note(thread.guild, thread.id),
+            author=requester,
+        )
+        async with thread.typing():
+            response = await anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                system=system_prompt,
+                messages=request_messages,
+            )
+    except Exception as exc:  # noqa: BLE001 — a failed opener must not break anything
+        print(f"[thread] opener generation failed: {exc}")
+        history.pop()  # drop the cue we added; nothing came of it
+        return
+
+    reply_text = "".join(b.text for b in response.content if b.type == "text").strip()
+    # Strip any action tags she slipped in — in the thread we only want her words
+    # (and this also stops a stray [thread:]/[invite:] in the opener from looping).
+    clean_text = parse_actions(reply_text)[0]
+    clean_text = resolve_emoji_markup(clean_text, thread.guild)
+    if not clean_text:
+        history.pop()
+        return
+    for i in range(0, len(clean_text), DISCORD_MAX_LEN):
+        await thread.send(clean_text[i:i + DISCORD_MAX_LEN])
+    history.append({"role": "assistant", "content": clean_text})
+
+
 async def process_thread_ops(
     message: discord.Message,
     requester,
@@ -756,6 +809,12 @@ async def process_thread_ops(
             await thread.add_user(member)
         except Exception as exc:  # noqa: BLE001
             print(f"[thread] add {member} failed: {exc}")
+
+    # Now that the room exists and people are in it, Molly opens the conversation
+    # so the thread isn't dead silent — picking up where they just were.
+    await post_thread_opener(
+        thread, requester, [getattr(m, "display_name", "") for m in ordered]
+    )
 
 
 def collect_images(message: discord.Message) -> tuple[list[dict], list[str]]:

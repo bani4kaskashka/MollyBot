@@ -213,10 +213,16 @@ the visible reply, errors swallowed — same fire-and-forget pattern as
   CHANNEL_ID`): threads can't nest, and a thread under home counts as home
   (`is_home_channel` via `parent_id`) so she talks freely in it with no ping.
   Per-channel `THREAD_COOLDOWN_SECONDS` floor so it can't be spam-summoned.
-- **Context carry-over** is backend-only (no synopsis posted): `seed_thread_context`
+- **Context carry-over** is backend (no synopsis pasted): `seed_thread_context`
   copies the parent channel's history deque + recent-speakers window into the new
   thread and marks it primed, so she continues exactly where she was and stored
   memory still loads. Durable per-user memory follows her anyway (keyed by user_id).
+- **She opens the thread herself**: `post_thread_opener` fires one model call
+  (fed the seeded context) so she posts a short in-character first line instead of
+  the thread sitting silent — explicitly an opener, *not* a recap/memory dump. The
+  opener's text is appended to the thread history; action tags in it are stripped
+  (which also stops a stray `[thread:]` in the opener from looping). Best-effort —
+  a failed opener just leaves the thread empty.
 - **Name resolution** (`resolve_invitee`) is deliberately robust: real @mentions in
   the message → recent speakers in the channel → guild-member search (exact, then a
   single unambiguous partial). Unknown/ambiguous names are skipped, not guessed.
