@@ -22,7 +22,7 @@ from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
 
 import memory
-from molly_prompt import MOLLY_SYSTEM_PROMPT
+from molly_prompt import MOLLY_SYSTEM_PROMPT, PERSONALITIES
 
 load_dotenv()
 
@@ -117,6 +117,15 @@ last_thread_at: dict[int, float] = {}
 # moment without becoming something she "remembers" or repeats. Resets on
 # restart, and another command (e.g. back to 140) overrides it.
 molly_heights: dict[int, int] = {}
+# Per-USER personality overlay chosen with /personality (any user can set one).
+# Maps (guild_id, user_id) -> a key in molly_prompt.PERSONALITIES, and changes
+# only how Molly talks TO THAT PERSON (injected per-turn based on who's speaking).
+# This is a fast READ CACHE for the durable copy in memory.py (MySQL): warmed from
+# the DB in on_ready and write-through on the slash commands, so the per-turn
+# lookup never hits the database. With MySQL it survives restarts; without it the
+# cache still works for the session (resets on restart) — same graceful-degrade
+# spirit as the rest of memory.py. /resetpersonality drops the entry.
+user_personalities: dict[tuple[int, int], str] = {}
 # Per-channel cooldown clock for replying to reactions on her own messages.
 last_reaction_reply_at: dict[int, float] = {}
 
@@ -502,6 +511,28 @@ def build_creator_note(author) -> str:
     )
 
 
+def build_personality_note(guild: "discord.Guild | None", author) -> str:
+    """Tell Molly to wear a chosen personality overlay for THIS speaker.
+
+    If the person currently talking has set one with /personality, return that
+    mode's prompt note (from molly_prompt.PERSONALITIES) so it can be appended to
+    the system prompt for their turns only. Returns "" for everyone who hasn't
+    set one (and for author=None / no guild, e.g. the height path's anonymous
+    cue). Keyed on (guild_id, user_id), so the overlay follows that one person in
+    that server, never the whole room. Reads the in-memory cache only — no DB hit.
+    """
+    user_id = getattr(author, "id", None)
+    if guild is None or user_id is None:
+        return ""
+    key = user_personalities.get((guild.id, user_id))
+    if not key:
+        return ""
+    cfg = PERSONALITIES.get(key)
+    if not cfg:
+        return ""
+    return "\n\n" + cfg["note"]
+
+
 def build_system_blocks(
     guild: "discord.Guild | None", channel_id: int, memory_note: str, author=None
 ) -> list[dict]:
@@ -511,8 +542,9 @@ def build_system_blocks(
     height override — goes in one block marked for prompt caching, so it's served
     from cache (~10% of input price) on repeat calls instead of being re-billed in
     full on every single message (the dominant cost). The volatile, per-speaker
-    notes — whether the creator is talking, plus the per-turn memory note — sit
-    AFTER the cache breakpoint, uncached, where they can't invalidate the prefix.
+    notes — whether the creator is talking, this speaker's chosen /personality
+    overlay, plus the per-turn memory note — sit AFTER the cache breakpoint,
+    uncached, where they can't invalidate the prefix.
 
     Caching only actually kicks in once the cached prefix clears the model's
     minimum (~4096 tokens on Haiku 4.5, ~2048 on Sonnet 4.6); under that it
@@ -527,7 +559,13 @@ def build_system_blocks(
         {"type": "text", "text": stable, "cache_control": {"type": "ephemeral"}}
     ]
     volatile = "".join(
-        part for part in (build_creator_note(author), memory_note) if part
+        part
+        for part in (
+            build_creator_note(author),
+            build_personality_note(guild, author),
+            memory_note,
+        )
+        if part
     )
     if volatile:
         blocks.append({"type": "text", "text": volatile})
@@ -1063,11 +1101,73 @@ async def mollynewchat(interaction: discord.Interaction) -> None:
     )
 
 
+@tree.command(
+    name="personality",
+    description="Pick how Molly acts with you (just you — changes nothing for anyone else).",
+)
+@app_commands.describe(style="The vibe you want Molly to have when she talks to you.")
+@app_commands.choices(
+    style=[
+        app_commands.Choice(name=cfg["label"], value=key)
+        for key, cfg in PERSONALITIES.items()
+    ]
+)
+async def personality(
+    interaction: discord.Interaction, style: app_commands.Choice[str]
+) -> None:
+    """Let ANY user pick a personality overlay for how Molly talks to THEM.
+
+    Unlike /mollynewchat and the height command (owner-only), this is open to
+    everyone — it only ever affects the runner's own conversations with Molly,
+    keyed by (guild, user), so one person can't change how she treats anyone
+    else. The choice is written through to MySQL (memory.py) so it survives
+    restarts, and mirrored into the in-memory read cache; without a database it
+    just lives for the session. /resetpersonality clears it. The confirmation is
+    ephemeral and in character, so the channel isn't spammed with a settings notice.
+    """
+    guild_id = interaction.guild_id
+    if guild_id is not None:
+        user_personalities[(guild_id, interaction.user.id)] = style.value
+        await memory.set_personality(guild_id, interaction.user.id, style.value)
+    cfg = PERSONALITIES.get(style.value, {})
+    await interaction.response.send_message(
+        cfg.get("ack", "aight, done :3"), ephemeral=True
+    )
+
+
+@tree.command(
+    name="resetpersonality",
+    description="Drop any personality you set and let Molly be her normal self with you.",
+)
+async def resetpersonality(interaction: discord.Interaction) -> None:
+    """Clear the runner's own /personality overlay (no-op if they had none).
+
+    Open to everyone, same as /personality — it only touches the runner's own
+    setting. Drops it from both the in-memory cache and MySQL (memory.py).
+    Ephemeral, in-character confirmation.
+    """
+    guild_id = interaction.guild_id
+    had = None
+    if guild_id is not None:
+        had = user_personalities.pop((guild_id, interaction.user.id), None)
+        await memory.clear_personality(guild_id, interaction.user.id)
+    msg = (
+        "aight, back to normal me :3 that was fun tho lol"
+        if had
+        else "lol you didn't have anything set, i'm already just me :p"
+    )
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
 @client.event
 async def on_ready() -> None:
     # Bring up persistent memory (idempotent — on_ready can fire on reconnects).
     # If MySQL isn't configured/reachable it just stays off and the bot runs on.
     await memory.init()
+    # Warm the personality read cache from the DB so people's chosen /personality
+    # overlays survive restarts. Empty (and harmless) when memory is disabled;
+    # update() so a reconnect-triggered on_ready can't wipe in-session changes.
+    user_personalities.update(await memory.all_personalities())
     # Register the slash command on Molly's own guild only (instant, and it won't
     # show up in any other server). Derived from the home channel so there's no
     # extra GUILD_ID to configure. Best-effort: a sync failure must not stop her.
@@ -1077,7 +1177,7 @@ async def on_ready() -> None:
         if guild is not None:
             tree.copy_global_to(guild=guild)
             await tree.sync(guild=guild)
-            print(f"[slash] /mollynewchat synced to {guild.name}")
+            print(f"[slash] commands synced to {guild.name}")
         else:
             print("[slash] home channel's guild not found — slash command not synced")
     except Exception as exc:  # noqa: BLE001 — slash sync must not crash startup

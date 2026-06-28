@@ -48,6 +48,19 @@ CREATE TABLE IF NOT EXISTS user_facts (
 ) DEFAULT CHARSET=utf8mb4
 """
 
+# Separate table for the per-user /personality overlay (one row per person per
+# guild — the chosen mode, not a list of facts). Keyed the same (guild_id,
+# user_id) way as user_facts so the same person is never split across labels.
+_PERSONALITY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS user_personalities (
+    guild_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    personality VARCHAR(64) NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (guild_id, user_id)
+) DEFAULT CHARSET=utf8mb4
+"""
+
 
 def enabled() -> bool:
     """True once a pool is live and the schema is ready; False means no-op mode."""
@@ -104,6 +117,7 @@ async def init() -> None:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(_SCHEMA)
+                await cur.execute(_PERSONALITY_SCHEMA)
         _pool = pool
         _enabled = True
         print("[memory] persistent memory enabled.")
@@ -212,3 +226,61 @@ async def facts_for(guild_id: int, user_ids: list[int]) -> dict[int, tuple[str, 
     return {
         uid: (name, facts[-MAX_FACTS_PER_USER:]) for uid, (name, facts) in out.items()
     }
+
+
+async def set_personality(guild_id: int, user_id: int, personality: str) -> None:
+    """Persist a user's chosen /personality overlay (upsert, one row per person).
+
+    No-op when memory is disabled — the caller keeps an in-memory cache either
+    way, so the feature still works in-session without a database; it just won't
+    survive a restart.
+    """
+    if not _enabled or not personality:
+        return
+    try:
+        async with _pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "INSERT INTO user_personalities (guild_id, user_id, personality) "
+                    "VALUES (%s, %s, %s) "
+                    "ON DUPLICATE KEY UPDATE personality=VALUES(personality)",
+                    (guild_id, user_id, personality[:64]),
+                )
+    except Exception as exc:  # noqa: BLE001 — a settings write must not break anything
+        print(f"[memory] set_personality failed: {exc}")
+
+
+async def clear_personality(guild_id: int, user_id: int) -> None:
+    """Drop a user's stored /personality overlay (no-op when disabled/absent)."""
+    if not _enabled:
+        return
+    try:
+        async with _pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "DELETE FROM user_personalities WHERE guild_id=%s AND user_id=%s",
+                    (guild_id, user_id),
+                )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[memory] clear_personality failed: {exc}")
+
+
+async def all_personalities() -> dict[tuple[int, int], str]:
+    """Load every stored personality as {(guild_id, user_id): personality}.
+
+    Called once on startup to warm bot.py's in-memory read cache, so the per-turn
+    lookup never touches the database. Empty dict when memory is disabled.
+    """
+    if not _enabled:
+        return {}
+    try:
+        async with _pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT guild_id, user_id, personality FROM user_personalities"
+                )
+                rows = await cur.fetchall()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[memory] all_personalities failed: {exc}")
+        return {}
+    return {(gid, uid): personality for gid, uid, personality in rows}

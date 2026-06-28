@@ -180,6 +180,42 @@ re-invite with that scope.
 - The confirmation is an **ephemeral** in-character reply (only the runner sees
   it), so resetting doesn't post a notice into the channel for everyone.
 
+### `/personality` + `/resetpersonality` slash commands (any user)
+
+Lets **anyone** pick how Molly talks to **them specifically**. Unlike the height
+command and `/mollynewchat` (owner-only), these are open to everyone because they
+only ever affect the runner's own conversations — they're **keyed by user id**, so
+one person setting a mode can't change how she treats anyone else.
+
+- The available personalities live in `molly_prompt.PERSONALITIES` (persona
+  wording → prompt file). Each entry is `label` (the choice name in Discord's
+  picker), `description` (maintainer note), `ack` (her ephemeral in-character
+  confirmation), and `note` (the prompt overlay). `/personality`'s choices are
+  built straight from this dict, so **adding a personality is a `molly_prompt.py`
+  edit only** — no `bot.py` change. Shipped modes: **brat** (cocky, arrogant,
+  swears a lot — the loud foul-mouthed one), **angry**, **sweet**, **shy**.
+- The selection is **durable** — stored in MySQL via `memory.py` in its own
+  `user_personalities` table, keyed by `(guild_id, user_id)` like the facts
+  table, so it **survives restarts**. With no database it degrades to
+  in-session-only (resets on restart), same graceful no-op as facts/GIFs.
+- `bot.py`'s `user_personalities` dict (`(guild_id, user_id) -> key`) is a
+  **fast read cache** of that table: warmed once from the DB in `on_ready`
+  (`memory.all_personalities()`), write-through on the commands
+  (`memory.set_personality` / `clear_personality`), so the per-turn lookup
+  **never hits the database**.
+- `build_personality_note(guild, author)` returns the chosen mode's `note` for
+  whoever's *currently speaking*, appended to the **volatile (uncached)** part of
+  the system prompt in `build_system_blocks` — exactly like
+  `build_creator_note(author)`, so it follows the speaker per-turn and never
+  invalidates the cached persona prefix.
+- The overlay **layers on top of** the base persona and the **HARD RULES** in
+  `molly_prompt.py` — it does **not** relax them. The brat/angry notes swear but
+  still ban slurs/sexual content and drop the act for real distress (kept within
+  Haiku's capabilities by being explicit attitude + casual profanity, not
+  anything the model would refuse).
+- Both confirmations are **ephemeral** in-character replies, so picking a vibe
+  doesn't spam the channel.
+
 ### Persistent per-user memory (`memory.py`)
 
 Durable facts Molly knows about individual people, surviving restarts. Backed by
