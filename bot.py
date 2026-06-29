@@ -1116,6 +1116,59 @@ async def mollynewchat(interaction: discord.Interaction) -> None:
 
 
 @tree.command(
+    name="mollypurge",
+    description="Delete EVERY message in this channel. Irreversible. Owner only.",
+)
+async def mollypurge(interaction: discord.Interaction) -> None:
+    """Owner-only hard wipe of a channel: deletes all messages in it.
+
+    Unlike /mollynewchat (which only clears Molly's *memory*), this deletes the
+    real Discord messages — everyone's, not just hers — and there's no undo.
+    Gated to the same controller handle as the height command (globally unique,
+    unspoofable). Works because the bot has Manage Messages (Administrator) in
+    the channel; without that permission purge() would raise Forbidden.
+
+    Discord's bulk delete only covers messages younger than 14 days; purge()
+    falls back to deleting older ones one-by-one, which is slow and rate-limited
+    — hence the deferred (and ephemeral) response so the interaction doesn't
+    time out and only the runner sees the confirmation.
+    """
+    if interaction.user.name.lower() != HEIGHT_CONTROLLER:
+        await interaction.response.send_message(
+            "nah, only my person gets to do that one :p", ephemeral=True
+        )
+        return
+    channel = interaction.channel
+    if channel is None or not hasattr(channel, "purge"):
+        await interaction.response.send_message(
+            "can't purge here :(", ephemeral=True
+        )
+        return
+    # Acknowledge first: purging can take a while (old messages delete one at a
+    # time), and an un-deferred interaction expires after a few seconds.
+    await interaction.response.defer(ephemeral=True)
+    try:
+        deleted = await channel.purge(limit=None)
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "i don't have permission to delete messages here :(", ephemeral=True
+        )
+        return
+    # The conversation she was tracking no longer exists, so drop her short-term
+    # memory of it too (same reset /mollynewchat does) — keeps her from referring
+    # to messages that are gone. Durable per-user memory is left alone.
+    channel_id = interaction.channel_id
+    if channel_id is not None:
+        histories.pop(channel_id, None)
+        recent_speakers.pop(channel_id, None)
+        fresh_start_at[channel_id] = interaction.created_at
+        primed_channels.add(channel_id)
+    await interaction.followup.send(
+        f"nuked it — {len(deleted)} messages gone :3", ephemeral=True
+    )
+
+
+@tree.command(
     name="personality",
     description="Pick how Molly acts with you (just you — changes nothing for anyone else).",
 )
