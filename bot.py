@@ -73,6 +73,23 @@ CREEP_STRIKE_WINDOW = 600      # calm for this long and the offense count resets
 THREAD_NAME_MAX = 90  # Discord caps thread names at 100; leave margin
 # How many server emoji/sticker names to list in the prompt, to bound token use.
 MAX_PROMPT_EMOJIS = 60
+# Server-side web tools (Anthropic-hosted, no client execution). web_search lets
+# Molly look things up ("check google"); web_fetch lets her read a URL already in
+# the conversation. These are the BASIC variants — Haiku 4.5 doesn't support the
+# dynamic-filtering _20260209 versions (those need Opus/Sonnet). No beta header is
+# needed; web_fetch is free, web_search bills per search, so max_uses caps the spend
+# per reply. The array is static (identical bytes every call) so it doesn't break
+# the prompt cache. citations stay OFF (the default): Molly answers in character and
+# never pastes source URLs (the prompt forbids it). Wired into the normal reply path
+# only — opener/rename/height/reaction calls don't pass tools.
+WEB_TOOLS = [
+    {"type": "web_search_20250305", "name": "web_search", "max_uses": 4},
+    {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 4},
+]
+# Server tools run a loop on Anthropic's side; if it hits the iteration cap mid-turn
+# the response comes back with stop_reason="pause_turn" and we re-send to let it
+# resume. Cap the resumes so a runaway can't loop forever.
+MAX_TOOL_CONTINUATIONS = 3
 MAX_PROMPT_STICKERS = 30
 
 # Molly signals reactions/GIFs/stickers with inline tags the users never see;
@@ -1612,6 +1629,31 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
         await respond_to_reaction(message, payload)
 
 
+async def create_reply(system_prompt, messages, *, tools=None):
+    """One model call with Molly's standard model/max_tokens, plus the server-side
+    tool continuation loop.
+
+    When `tools` (WEB_TOOLS) is passed, web_search/web_fetch run on Anthropic's
+    side. If the server hits its tool-iteration cap mid-turn the response comes
+    back with stop_reason="pause_turn"; we append the partial assistant turn and
+    re-send so it resumes, capped by MAX_TOOL_CONTINUATIONS. Returns the final
+    response. Callers extract text exactly as before — the search/fetch result
+    blocks aren't `text` blocks, so the existing `b.type == "text"` filtering
+    ignores them untouched.
+    """
+    kwargs = {"model": MODEL, "max_tokens": MAX_TOKENS, "system": system_prompt}
+    if tools:
+        kwargs["tools"] = tools
+    convo = list(messages)
+    response = await anthropic_client.messages.create(messages=convo, **kwargs)
+    resumes = 0
+    while response.stop_reason == "pause_turn" and resumes < MAX_TOOL_CONTINUATIONS:
+        convo = [*convo, {"role": "assistant", "content": response.content}]
+        response = await anthropic_client.messages.create(messages=convo, **kwargs)
+        resumes += 1
+    return response
+
+
 async def generate_and_reply(
     message: discord.Message,
     content: str,
@@ -1672,11 +1714,8 @@ async def generate_and_reply(
     try:
         async with message.channel.typing():
             try:
-                response = await anthropic_client.messages.create(
-                    model=MODEL,
-                    max_tokens=MAX_TOKENS,
-                    system=system_prompt,
-                    messages=vision_messages,
+                response = await create_reply(
+                    system_prompt, vision_messages, tools=WEB_TOOLS
                 )
             except Exception as vision_exc:  # noqa: BLE001
                 # If an image couldn't be fetched/parsed, retry without images
@@ -1684,11 +1723,8 @@ async def generate_and_reply(
                 if not image_blocks:
                     raise
                 print(f"Vision request failed, retrying text-only: {vision_exc}")
-                response = await anthropic_client.messages.create(
-                    model=MODEL,
-                    max_tokens=MAX_TOKENS,
-                    system=system_prompt,
-                    messages=request_messages,
+                response = await create_reply(
+                    system_prompt, request_messages, tools=WEB_TOOLS
                 )
     except Exception as exc:  # noqa: BLE001 — surface any API/network failure
         print(f"Anthropic API error: {exc}")

@@ -307,6 +307,17 @@ the visible reply, errors swallowed — same fire-and-forget pattern as
   on-request rename and the *occasional* "want me to rename this to …?" offer
   when a thread's theme has clearly shifted — she asks first and only emits the
   tag once they agree, never unprompted. Last `[rename:]` tag wins.
+  - **Deliberate design: she does NOT rename truly unprompted.** The two
+    automatic paths are her *offer* (asks first, renames only on a yes) and the
+    owner-run `/mollythreadrename` (renames straight off, no asking). Silently
+    renaming a thread mid-chat is jarring, and on the small model she'd misjudge
+    *when* and rename too eagerly — hence the "ask, or owner-command" gate.
+    **If you ever want fully autonomous renaming** (she renames the moment the
+    topic shifts, no asking): in `molly_prompt.py`'s PRIVATE THREADS "RENAMING A
+    THREAD" bullet, drop the "ASK first … only once they say yes" wording and tell
+    her to just emit `[rename: …]` when the old name is stale. No `bot.py` change
+    needed — the `[rename:]` plumbing already performs it. (Recommended to keep the
+    ask-first guard; this note is just the escape hatch.)
 - **Who gets added, in order**: the **owner always first** (the `HEIGHT_CONTROLLER`
   handle, via `resolve_owner_member`, cached per guild), then the **requester**
   (the current human speaker — `memory_subject`, i.e. `message.author`), then any
@@ -330,6 +341,45 @@ the visible reply, errors swallowed — same fire-and-forget pattern as
   single unambiguous partial). Unknown/ambiguous names are skipped, not guessed.
 - Private threads need **Create Private Threads** + **Send Messages in Threads**;
   `add_user` works because the bot is the thread's creator.
+
+### Web search & fetch (server tools)
+
+Molly can look things up online ("check google") and read a link someone drops.
+This is **not** a tag convention — it's Anthropic's **server-side** tools, declared
+in `WEB_TOOLS` and passed to the model call. No client-side execution, no parsing:
+the API runs the search/fetch on its own infrastructure and folds the results into
+the same response.
+
+- `WEB_TOOLS` (top of `bot.py`) holds `web_search_20250305` + `web_fetch_20250910`
+  — the **basic** variants, because **Haiku 4.5 doesn't support the
+  dynamic-filtering `_20260209` versions** (those need Opus/Sonnet). No beta header
+  is required. **`web_fetch` only fetches URLs already in the conversation** (a user
+  message or a prior search result), never arbitrary ones — so "read this link"
+  works, "go find me a page" routes through search first. `max_uses` caps calls per
+  reply; `citations` stays off (default) so she never pastes source URLs.
+- **Cost**: `web_fetch` is free (you pay only for the fetched tokens that enter
+  context); `web_search` **bills per search** (the GIF/reaction-style "tune the
+  prompt eagerness" caveat applies — see `molly_prompt.py`'s "LOOKING THINGS UP"
+  section, which governs how freely she reaches for it). The fetched/searched result
+  text also lands in context as input tokens, so it's a spend lever like
+  `HISTORY_LIMIT`.
+- **Wired into the normal reply path only** (`generate_and_reply`, both the vision
+  call and its text-only retry, via `create_reply(..., tools=WEB_TOOLS)`). The
+  opener, rename, height-jolt, and reaction-reply calls deliberately pass **no
+  tools** — they don't need lookups and shouldn't pay for the option.
+- `create_reply()` centralizes the call and the **server-tool continuation loop**:
+  server tools run a loop on Anthropic's side, and if it hits the iteration cap
+  mid-turn the response returns `stop_reason="pause_turn"`. We append the partial
+  assistant turn and re-send to resume, capped by `MAX_TOOL_CONTINUATIONS`. Text
+  extraction is unchanged everywhere — `server_tool_use` / `web_search_tool_result`
+  / `web_fetch_tool_result` blocks aren't `text` blocks, so the existing
+  `b.type == "text"` filtering ignores them. The `WEB_TOOLS` array is **static**
+  (identical bytes every call), so it renders ahead of the system prompt without
+  breaking the cached prefix.
+- **Not yet built: image search.** Web search returns text + links, not postable
+  images. A `[image: query]` tag (mirroring the Klipy `[gif:]` plumbing, backed by
+  an image-search API + a new key) is the planned follow-up for actually pulling
+  pictures.
 
 ### Inline action tags (the key convention)
 
@@ -379,6 +429,23 @@ thread openers) is the code-level backstop: it swaps any `—`/`–` (plus the r
 ## Ideas / not yet built
 
 Maintainer suggestions parked here for later — **not implemented**.
+
+- **Image search → `[image: query]` tag.** Let Molly actually *pull pictures* on
+  request, not just text. Web search (now shipped — see "Web search & fetch") only
+  returns text + links, and there is **no Anthropic image-search server tool**, so
+  this needs a real image-search API. Sketch:
+  - Mirror the existing Klipy/`[gif:]` plumbing exactly: she emits `[image: search
+    terms]`, `parse_actions` pulls it out, and the bot calls an image-search API and
+    posts the top result URL (Discord unfurls it — **Embed Links** is already on).
+  - **API options**: Google **Programmable Search Engine** (Custom Search JSON API,
+    `searchType=image`) or **SerpAPI**. Either needs a new env var (e.g.
+    `IMAGE_SEARCH_API_KEY`), kept **optional** so the bot still runs without it —
+    same graceful no-op as `KLIPY_API_KEY`/`MYSQL_URL`.
+  - Add an `IMAGE_COOLDOWN_SECONDS` per-channel floor (like `GIF_COOLDOWN_SECONDS`)
+    and a safe-search setting; gate eagerness in `molly_prompt.py` the same way
+    GIFs/reactions are (prompt wording + a hard cap), since it costs an API call.
+  - Prompt-side: a short "you can pull up a picture when asked" note, and the usual
+    "never mention tags/feature, just send it" framing.
 
 - **Patreon → announcement channel.** Have Molly post the maintainer's new Patreon
   releases (in character) to a dedicated announcements channel. Sketch from
