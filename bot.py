@@ -58,12 +58,18 @@ THREAD_COOLDOWN_SECONDS = 30
 # Creep handling. When Molly emits the [disengage] tag she's flagging GENUINE,
 # full-on creep behaviour — sexual pushing, dominance/submission, "do this with
 # your body" — NOT jokes or normal flirting (the line is drawn in molly_prompt.py).
-# First strike: her short-term history for the channel is wiped so the creepy turns
-# can't keep poisoning her context (the same reset /mollynewchat does). If the SAME
-# person trips it AGAIN within CREEP_STRIKE_WINDOW (i.e. they kept going right after
-# the reset), she goes on a CREEP_MUTE_SECONDS break and just ignores their messages.
-CREEP_MUTE_SECONDS = 300       # 5-minute cool-off where she won't answer the offender
-CREEP_STRIKE_WINDOW = 600      # a second [disengage] within this escalates to the mute
+# Escalation is per-offender:
+#   - 1st offense: her short-term history for the channel is wiped so the creepy
+#     turns can't keep poisoning her context (the same reset /mollynewchat does)
+#     and she gives one "i'm stepping away" brush-off. NO timed break yet.
+#   - 2nd offense and EVERY one after: same reset, plus a CREEP_MUTE_SECONDS break
+#     where she simply doesn't reply to that person (an internal ignore — NOT a
+#     Discord server mute/timeout; they can still talk, she just won't answer),
+#     telling them once she's on a break.
+# The offense count decays: if someone behaves for CREEP_STRIKE_WINDOW, their next
+# slip is treated as a fresh 1st offense again.
+CREEP_MUTE_SECONDS = 300       # 5-minute break where she won't answer the offender
+CREEP_STRIKE_WINDOW = 600      # calm for this long and the offense count resets to 0
 THREAD_NAME_MAX = 90  # Discord caps thread names at 100; leave margin
 # How many server emoji/sticker names to list in the prompt, to bound token use.
 MAX_PROMPT_EMOJIS = 60
@@ -152,13 +158,15 @@ user_personalities: dict[tuple[int, int], str] = {}
 # Per-channel cooldown clock for replying to reactions on her own messages.
 last_reaction_reply_at: dict[int, float] = {}
 
-# Creep handling state, keyed by (channel_id, user_id). creep_strikes holds the
-# monotonic time of a user's last [disengage] strike (used to tell a one-off creep
-# from someone who kept going right after the reset); creep_muted_until holds when
-# their 5-minute break expires; creep_break_notified marks that the single "i'm on
-# a break" line has already been sent for the current mute so it isn't repeated on
-# every message. All RAM-only — they reset on restart, same as the height state.
-creep_strikes: dict[tuple[int, int], float] = {}
+# Creep handling state, keyed by (channel_id, user_id). creep_offenses counts how
+# many times a user has tripped the creep brake (decays after CREEP_STRIKE_WINDOW
+# of calm) — 1st offense is a warning, 2nd+ each earn a break; creep_last_offense_at
+# is the monotonic time of their last offense, used for that decay; creep_muted_until
+# holds when their current break expires; creep_break_notified marks that the single
+# "i'm on a break" line has already been sent for the current break so it isn't
+# repeated on every message. All RAM-only — they reset on restart, like the height state.
+creep_offenses: dict[tuple[int, int], int] = {}
+creep_last_offense_at: dict[tuple[int, int], float] = {}
 creep_muted_until: dict[tuple[int, int], float] = {}
 creep_break_notified: set[tuple[int, int]] = set()
 
@@ -1353,12 +1361,12 @@ async def on_message(message: discord.Message) -> None:
     if not is_home and not mentioned:
         return
 
-    # Creep cool-off. If this user already tripped the creep brake twice (kept being
-    # a creep right after she reset), she's on a short break from THEM specifically:
-    # ignore their messages with no model call (so it costs nothing), sending a
-    # single "i'm on a break" line the first time so it isn't just silence. Once the
-    # break elapses the entry is cleared and she's normal with them again. Per-user,
-    # so everyone else in the channel is unaffected.
+    # Creep cool-off. If this user is on a break (2nd creep offense or later), she
+    # simply doesn't answer THEM for the duration — ignore their messages with no
+    # model call (so it costs nothing), sending a single "i'm on a break" line the
+    # first time so it isn't just silence. NOT a Discord mute: they can still talk,
+    # she just won't reply. Once the break elapses the entry is cleared and she's
+    # normal with them again. Per-user, so everyone else in the channel is unaffected.
     mute_key = (message.channel.id, message.author.id)
     mute_until = creep_muted_until.get(mute_key)
     if mute_until is not None:
@@ -1661,16 +1669,30 @@ def handle_creep_disengage(message: discord.Message, offender) -> None:
     Always wipes the channel's short-term history (the same reset /mollynewchat
     does) so the creepy turns stop being re-sent every turn and poisoning her
     context — she's noticeably calmer reading a clean slate than re-reading the
-    exchange. Durable per-user memory (memory.py) is left untouched. If this SAME
-    person already tripped the brake within CREEP_STRIKE_WINDOW — i.e. they kept
-    going right after the reset — they're put on a CREEP_MUTE_SECONDS break, during
-    which on_message ignores them. Owner/creator are never muted: a misfired
-    [disengage] shouldn't lock them out. State is RAM-only (resets on restart).
+    exchange. Durable per-user memory (memory.py) is left untouched.
+
+    Escalates per offender: the 1st offense is just the reset + her in-character
+    brush-off (no break). The 2nd offense and EVERY one after each put them on a
+    CREEP_MUTE_SECONDS break, during which on_message simply doesn't answer them
+    (an internal ignore, NOT a Discord mute). The count decays after
+    CREEP_STRIKE_WINDOW of calm, so a one-off slip much later starts fresh.
+    Owner/creator are never put on a break: a misfired [disengage] mustn't lock
+    them out. State is RAM-only (resets on restart).
     """
     channel_id = message.channel.id
     key = (channel_id, offender.id)
     now = time.monotonic()
-    prev = creep_strikes.get(key)
+
+    # Bump the offense count, but reset it first if they've been calm for a while
+    # (a slip an hour later isn't "kept going", so it gets the lighter 1st-offense
+    # treatment again).
+    last = creep_last_offense_at.get(key)
+    count = creep_offenses.get(key, 0)
+    if last is None or now - last > CREEP_STRIKE_WINDOW:
+        count = 0
+    count += 1
+    creep_offenses[key] = count
+    creep_last_offense_at[key] = now
 
     # Wipe the short-term conversation so the creep turns can't keep poisoning her
     # context. Drop a fresh-start boundary so priming won't backfill them either.
@@ -1679,14 +1701,13 @@ def handle_creep_disengage(message: discord.Message, offender) -> None:
     fresh_start_at[channel_id] = message.created_at
     primed_channels.add(channel_id)
 
-    # Repeat offender (kept going after a recent reset) → short mute, unless they're
-    # the owner/creator (a stray [disengage] must never lock them out).
+    # 2nd offense and every one after → a fresh break where she ignores them,
+    # unless they're the owner/creator (a stray [disengage] must never lock them out).
     handle = (getattr(offender, "name", "") or "").lower()
     is_privileged = handle in (HEIGHT_CONTROLLER, MOLLY_CREATOR)
-    if prev is not None and now - prev < CREEP_STRIKE_WINDOW and not is_privileged:
+    if count >= 2 and not is_privileged:
         creep_muted_until[key] = now + CREEP_MUTE_SECONDS
         creep_break_notified.discard(key)
-    creep_strikes[key] = now
 
 
 async def apply_height_shift(message: discord.Message, height: int) -> None:
