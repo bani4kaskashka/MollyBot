@@ -55,6 +55,15 @@ REACTION_REPLY_COOLDOWN = 45
 # Floor between Molly opening private threads in a channel, so "make a thread" can't
 # be spam-summoned (every thread also pings the owner, so this matters).
 THREAD_COOLDOWN_SECONDS = 30
+# Creep handling. When Molly emits the [disengage] tag she's flagging GENUINE,
+# full-on creep behaviour — sexual pushing, dominance/submission, "do this with
+# your body" — NOT jokes or normal flirting (the line is drawn in molly_prompt.py).
+# First strike: her short-term history for the channel is wiped so the creepy turns
+# can't keep poisoning her context (the same reset /mollynewchat does). If the SAME
+# person trips it AGAIN within CREEP_STRIKE_WINDOW (i.e. they kept going right after
+# the reset), she goes on a CREEP_MUTE_SECONDS break and just ignores their messages.
+CREEP_MUTE_SECONDS = 300       # 5-minute cool-off where she won't answer the offender
+CREEP_STRIKE_WINDOW = 600      # a second [disengage] within this escalates to the mute
 THREAD_NAME_MAX = 90  # Discord caps thread names at 100; leave margin
 # How many server emoji/sticker names to list in the prompt, to bound token use.
 MAX_PROMPT_EMOJIS = 60
@@ -77,6 +86,10 @@ FORGET_TAG_RE = re.compile(r"\[forget:\s*([^\]]+?)\s*\]", re.IGNORECASE)
 # already in. Names are resolved leniently (see resolve_invitee).
 THREAD_TAG_RE = re.compile(r"\[thread:\s*([^\]]+?)\s*\]", re.IGNORECASE)
 INVITE_TAG_RE = re.compile(r"\[invite:\s*([^\]]+?)\s*\]", re.IGNORECASE)
+# Creep brake. Molly appends "[disengage]" when she's been genuinely creeped on
+# (see CREEP_* constants and molly_prompt.py). It's stripped from what users see;
+# the bot uses it to wipe context / escalate to a mute.
+DISENGAGE_TAG_RE = re.compile(r"\[disengage\]", re.IGNORECASE)
 EMOJI_SHORTCODE_RE = re.compile(r":([a-zA-Z0-9_]{2,32}):")
 # Custom emoji as they appear in raw message content: <:name:id> / <a:name:id>.
 CUSTOM_EMOJI_RE = re.compile(r"<(a)?:(\w+):(\d+)>")
@@ -138,6 +151,16 @@ molly_heights: dict[int, int] = {}
 user_personalities: dict[tuple[int, int], str] = {}
 # Per-channel cooldown clock for replying to reactions on her own messages.
 last_reaction_reply_at: dict[int, float] = {}
+
+# Creep handling state, keyed by (channel_id, user_id). creep_strikes holds the
+# monotonic time of a user's last [disengage] strike (used to tell a one-off creep
+# from someone who kept going right after the reset); creep_muted_until holds when
+# their 5-minute break expires; creep_break_notified marks that the single "i'm on
+# a break" line has already been sent for the current mute so it isn't repeated on
+# every message. All RAM-only — they reset on restart, same as the height state.
+creep_strikes: dict[tuple[int, int], float] = {}
+creep_muted_until: dict[tuple[int, int], float] = {}
+creep_break_notified: set[tuple[int, int]] = set()
 
 # Shared conversation history, keyed by Discord *channel* ID so Molly sees the
 # whole room and can keep individuals straight. Each value is a bounded deque
@@ -223,20 +246,22 @@ def parse_actions(
     reply_text: str,
 ) -> tuple[
     str, list[str], str | None, list[str], list[str], list[str],
-    tuple[str, list[str]] | None, list[str],
+    tuple[str, list[str]] | None, list[str], bool,
 ]:
     """Pull Molly's inline action tags out of her reply.
 
     Returns (clean_text, reactions, gif_query, sticker_names, remembers, forgets,
-    thread_request, invites): the message the users actually see, up to
+    thread_request, invites, disengaged): the message the users actually see, up to
     MAX_REACTIONS emoji to react with, an optional GIF search query (the last
     [gif:...] tag wins if she emits more than one), up to MAX_STICKERS
     server-sticker names to attach, the raw bodies of any [remember:...] /
     [forget:...] memory tags, an optional (title, [extra invitee names]) private
-    thread to open (the first [thread:...] tag wins), and any [invite:...] names
-    to add to the current thread. Threads/invites are resolved and performed
-    later by process_thread_ops.
+    thread to open (the first [thread:...] tag wins), any [invite:...] names
+    to add to the current thread, and whether she emitted [disengage] (the creep
+    brake — see deliver_reply). Threads/invites are resolved and performed later
+    by process_thread_ops.
     """
+    disengaged = bool(DISENGAGE_TAG_RE.search(reply_text))
     reactions = [m.strip() for m in REACT_TAG_RE.findall(reply_text)][:MAX_REACTIONS]
     gif_matches = GIF_TAG_RE.findall(reply_text)
     gif_query = gif_matches[-1].strip() if gif_matches else None
@@ -258,16 +283,19 @@ def parse_actions(
     for body in INVITE_TAG_RE.findall(reply_text):
         invites.extend(n.strip() for n in re.split(r"[;,]", body) if n.strip())
 
-    clean_text = INVITE_TAG_RE.sub(
+    clean_text = DISENGAGE_TAG_RE.sub(
         "",
-        THREAD_TAG_RE.sub(
+        INVITE_TAG_RE.sub(
             "",
-            FORGET_TAG_RE.sub(
+            THREAD_TAG_RE.sub(
                 "",
-                REMEMBER_TAG_RE.sub(
+                FORGET_TAG_RE.sub(
                     "",
-                    STICKER_TAG_RE.sub(
-                        "", GIF_TAG_RE.sub("", REACT_TAG_RE.sub("", reply_text))
+                    REMEMBER_TAG_RE.sub(
+                        "",
+                        STICKER_TAG_RE.sub(
+                            "", GIF_TAG_RE.sub("", REACT_TAG_RE.sub("", reply_text))
+                        ),
                     ),
                 ),
             ),
@@ -284,7 +312,7 @@ def parse_actions(
     clean_text = re.sub(r"\n[ \t]*(?:\n[ \t]*)+", "\n", clean_text).strip()
     return (
         clean_text, reactions, gif_query, sticker_names, remembers, forgets,
-        thread_request, invites,
+        thread_request, invites, disengaged,
     )
 
 
@@ -1325,6 +1353,29 @@ async def on_message(message: discord.Message) -> None:
     if not is_home and not mentioned:
         return
 
+    # Creep cool-off. If this user already tripped the creep brake twice (kept being
+    # a creep right after she reset), she's on a short break from THEM specifically:
+    # ignore their messages with no model call (so it costs nothing), sending a
+    # single "i'm on a break" line the first time so it isn't just silence. Once the
+    # break elapses the entry is cleared and she's normal with them again. Per-user,
+    # so everyone else in the channel is unaffected.
+    mute_key = (message.channel.id, message.author.id)
+    mute_until = creep_muted_until.get(mute_key)
+    if mute_until is not None:
+        if time.monotonic() < mute_until:
+            if mute_key not in creep_break_notified:
+                creep_break_notified.add(mute_key)
+                try:
+                    await message.channel.send(
+                        "nah. i'm taking a break from you for a bit — "
+                        "i'm here to chat, not for that. talk to me later."
+                    )
+                except discord.HTTPException:
+                    pass
+            return
+        creep_muted_until.pop(mute_key, None)
+        creep_break_notified.discard(mute_key)
+
     # Even at home, stay out of a Discord reply aimed at *another person* — two
     # people talking to each other — unless she was actually pinged. A reply to
     # her own message, or one to Molly, still gets a response.
@@ -1483,7 +1534,8 @@ async def generate_and_reply(
     # she actually did so next turn's history stays coherent. Memory tags bind to
     # the person she's replying to (the message author).
     history_note = await deliver_reply(
-        message, reply_text, memory_subject=message.author
+        message, reply_text, memory_subject=message.author,
+        creep_offender=message.author,
     )
     history.append({"role": "assistant", "content": history_note})
 
@@ -1502,7 +1554,8 @@ async def reply_or_send(message: discord.Message, content: str | None = None, **
 
 
 async def deliver_reply(
-    message: discord.Message, reply_text: str, *, memory_subject=None
+    message: discord.Message, reply_text: str, *, memory_subject=None,
+    creep_offender=None,
 ) -> str:
     """Act on Molly's raw reply and post it; return the text to store in history.
 
@@ -1512,10 +1565,16 @@ async def deliver_reply(
     (chunked to Discord's limit). Returns the cleaned text — or a short
     placeholder when she only reacted/giffed/stickered — for the caller to record
     (or ignore).
+
+    If `creep_offender` is given (the human she's replying to in the normal chat
+    path) and she emitted [disengage], her creep brake fires after the visible
+    reply: the channel's short-term history is wiped, and a repeat offender is put
+    on a short mute (see handle_creep_disengage). Paths where the "author" isn't a
+    real human (height jolt, reaction reply) just don't pass it, so it never fires.
     """
     (
         clean_text, reactions, gif_query, sticker_names, remembers, forgets,
-        thread_request, invites,
+        thread_request, invites, disengaged,
     ) = parse_actions(reply_text)
     guild = message.guild
 
@@ -1587,7 +1646,47 @@ async def deliver_reply(
     # or break the visible reply (process_memory_ops also swallows its own errors).
     await process_memory_ops(message, memory_subject, remembers, forgets)
 
+    # Creep brake, after the visible brush-off line has gone out. Only the normal
+    # chat path passes a creep_offender (a real human), so this never fires on the
+    # height/reaction paths where message.author is Molly herself.
+    if disengaged and creep_offender is not None:
+        handle_creep_disengage(message, creep_offender)
+
     return history_note
+
+
+def handle_creep_disengage(message: discord.Message, offender) -> None:
+    """React (mechanically) to Molly flagging genuine creep behaviour via [disengage].
+
+    Always wipes the channel's short-term history (the same reset /mollynewchat
+    does) so the creepy turns stop being re-sent every turn and poisoning her
+    context — she's noticeably calmer reading a clean slate than re-reading the
+    exchange. Durable per-user memory (memory.py) is left untouched. If this SAME
+    person already tripped the brake within CREEP_STRIKE_WINDOW — i.e. they kept
+    going right after the reset — they're put on a CREEP_MUTE_SECONDS break, during
+    which on_message ignores them. Owner/creator are never muted: a misfired
+    [disengage] shouldn't lock them out. State is RAM-only (resets on restart).
+    """
+    channel_id = message.channel.id
+    key = (channel_id, offender.id)
+    now = time.monotonic()
+    prev = creep_strikes.get(key)
+
+    # Wipe the short-term conversation so the creep turns can't keep poisoning her
+    # context. Drop a fresh-start boundary so priming won't backfill them either.
+    histories.pop(channel_id, None)
+    recent_speakers.pop(channel_id, None)
+    fresh_start_at[channel_id] = message.created_at
+    primed_channels.add(channel_id)
+
+    # Repeat offender (kept going after a recent reset) → short mute, unless they're
+    # the owner/creator (a stray [disengage] must never lock them out).
+    handle = (getattr(offender, "name", "") or "").lower()
+    is_privileged = handle in (HEIGHT_CONTROLLER, MOLLY_CREATOR)
+    if prev is not None and now - prev < CREEP_STRIKE_WINDOW and not is_privileged:
+        creep_muted_until[key] = now + CREEP_MUTE_SECONDS
+        creep_break_notified.discard(key)
+    creep_strikes[key] = now
 
 
 async def apply_height_shift(message: discord.Message, height: int) -> None:
