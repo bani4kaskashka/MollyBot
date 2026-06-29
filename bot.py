@@ -872,6 +872,77 @@ async def post_thread_opener(thread: discord.Thread, requester, invited_names: l
     history.append({"role": "assistant", "content": clean_text})
 
 
+async def rename_thread_from_conversation(
+    thread: discord.Thread, requester
+) -> str | None:
+    """Pick a fitting new name for a thread from its conversation and rename it.
+
+    Drives the owner-only /mollythreadrename. One model call, fed the thread's
+    history, asks Molly in character to choose a short title that fits what's been
+    going on and emit it as a [rename:] tag; we then perform the rename and post
+    her one short in-character line in the thread. Reuses the same [rename:] path
+    (and its THREAD_NAME_MAX cap / dash-stripping) as her own offers. Returns the
+    new name, or None if she produced nothing usable or Discord refused the edit.
+    Self-contained and best-effort — errors are swallowed so the command always
+    answers.
+    """
+    history = get_history(thread.id)
+    cue = (
+        "(Someone just asked you to rename THIS thread so its name actually fits "
+        "what everyone's been talking about in here. Look back over the "
+        "conversation above, pick ONE short, fitting name for the room, a few "
+        "words, lowercase and casual like you'd name a group chat, and rename it "
+        "now by writing the tag [rename: the new name]. Then say ONE short "
+        "in-character line about the new name as you change it, nothing more. Do "
+        "NOT recap or list the conversation.)"
+    )
+    history.append({"role": "user", "content": cue})
+    try:
+        request_messages = build_request_messages(history)
+        system_prompt = build_system_blocks(
+            thread.guild,
+            thread.id,
+            await build_memory_note(thread.guild, thread.id),
+            author=requester,
+        )
+        async with thread.typing():
+            response = await anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                system=system_prompt,
+                messages=request_messages,
+            )
+    except Exception as exc:  # noqa: BLE001 — a failed rename must not break the command
+        print(f"[thread] rename generation failed: {exc}")
+        history.pop()  # drop the cue; nothing came of it
+        return None
+
+    reply_text = "".join(b.text for b in response.content if b.type == "text").strip()
+    (
+        clean_text, _re, _gif, _st, _rem, _fo, _thr, _inv, rename_request, _dis,
+    ) = parse_actions(reply_text)
+    if not rename_request:
+        history.pop()  # she didn't emit a name — leave history clean
+        return None
+    new_name = rename_request[:THREAD_NAME_MAX]
+    try:
+        await thread.edit(name=new_name)
+    except Exception as exc:  # noqa: BLE001 — Discord refused (perms etc.); report no rename
+        print(f"[thread] rename to {new_name!r} failed: {exc}")
+        history.pop()
+        return None
+    # Post her short in-character line about the change (if any) and record it, so
+    # the thread reads naturally and she stays consistent from here.
+    clean_text = resolve_emoji_markup(clean_text, thread.guild)
+    if clean_text:
+        for i in range(0, len(clean_text), DISCORD_MAX_LEN):
+            await thread.send(clean_text[i:i + DISCORD_MAX_LEN])
+        history.append({"role": "assistant", "content": clean_text})
+    else:
+        history.pop()  # only the tag, no words — drop the cue, keep history tidy
+    return new_name
+
+
 async def process_thread_ops(
     message: discord.Message,
     requester,
@@ -1255,6 +1326,53 @@ async def mollypurge(interaction: discord.Interaction) -> None:
     await interaction.followup.send(
         f"nuked it — {len(deleted)} messages gone :3", ephemeral=True
     )
+
+
+@tree.command(
+    name="mollythreadrename",
+    description="Have Molly rename THIS thread to fit what's been talked about here. Owner only.",
+)
+async def mollythreadrename(interaction: discord.Interaction) -> None:
+    """Owner-only: make Molly rename the current thread to fit its conversation.
+
+    Runs inside a thread. Gated to the same controller handle as the height
+    command and /mollynewchat (globally unique, unspoofable). One model call has
+    her pick a short fitting name from what's been said in the thread and rename
+    it — via the same [rename:] path as her own offers — and post one in-character
+    line. The confirmation is ephemeral, so only the runner sees it.
+    """
+    if interaction.user.name.lower() != HEIGHT_CONTROLLER:
+        await interaction.response.send_message(
+            "nah, only my person gets to do that one :p", ephemeral=True
+        )
+        return
+    channel = interaction.channel
+    if not isinstance(channel, discord.Thread):
+        await interaction.response.send_message(
+            "this one only works inside a thread :p", ephemeral=True
+        )
+        return
+    # The model call + Discord edit take a moment; defer so the interaction doesn't
+    # time out, ephemeral so the channel isn't spammed with a notice.
+    await interaction.response.defer(ephemeral=True)
+    # If she isn't already tracking this thread (an old/foreign one), seed it from
+    # its recent messages so she has a conversation to base the name on. Object(id=
+    # interaction.id) is a snowflake newer than every message, so "before" it just
+    # means the most recent ones.
+    history = get_history(channel.id)
+    if not history:
+        await prime_channel_context(channel, history, discord.Object(id=interaction.id))
+    new_name = await rename_thread_from_conversation(channel, interaction.user)
+    if new_name:
+        await interaction.followup.send(
+            f"done, renamed it to '{new_name}' :3", ephemeral=True
+        )
+    else:
+        await interaction.followup.send(
+            "couldn't come up with anything that fit (or i can't rename this one) "
+            "— try again in a sec? :p",
+            ephemeral=True,
+        )
 
 
 @tree.command(

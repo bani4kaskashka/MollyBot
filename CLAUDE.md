@@ -180,6 +180,30 @@ re-invite with that scope.
 - The confirmation is an **ephemeral** in-character reply (only the runner sees
   it), so resetting doesn't post a notice into the channel for everyone.
 
+### `/mollythreadrename` slash command (controller only)
+
+Owner-only command, run **inside a thread**, that makes Molly rename that thread
+to fit what's been talked about in it — the manual trigger for the same
+[rename:] behaviour she otherwise only offers on her own. Gated to the
+`HEIGHT_CONTROLLER` handle (same unspoofable owner identity as the height command
+and `/mollynewchat`); anyone else, or running it outside a thread, gets an
+ephemeral brush-off.
+
+- It `defer`s (model call + Discord edit take a beat) then calls
+  `rename_thread_from_conversation`: one model call, fed the thread's history,
+  cues her in character to pick a short fitting name and emit a `[rename: …]` tag.
+  We perform the rename (`thread.edit(name=…)`, trimmed to `THREAD_NAME_MAX`) and
+  post her one short in-character line in the thread, so it reuses the exact
+  rename plumbing — cap and dash-stripping — as her self-initiated offers.
+- If she **isn't already tracking** the thread (an old/foreign one with an empty
+  history deque), the command first seeds it via `prime_channel_context` using
+  `discord.Object(id=interaction.id)` as the `before` snowflake (newer than every
+  message → the most recent ones), so she has a conversation to base the name on.
+- The confirmation is **ephemeral** (reports the new name, or a "couldn't think of
+  one / can't rename this" miss). The rename itself is best-effort: a failed model
+  call or a Discord refusal (e.g. no Manage Threads on a thread she didn't create)
+  just yields the miss reply, never an error.
+
 ### `/personality` + `/resetpersonality` slash commands (any user)
 
 Lets **anyone** pick how Molly talks to **them specifically**. Unlike the height
