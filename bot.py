@@ -99,6 +99,16 @@ MOLLY_CREATOR = os.environ.get("MOLLY_CREATOR", "zamalkogts").lower()
 # height control back to her emotions (pure persona behaviour).
 BASELINE_HEIGHT_CM = 140
 
+# Direct messages are OFF-LIMITS. Molly only ever talks in Zamalko's server, never
+# in a 1:1 DM — every DM (even one that @-mentions her) gets this single canned,
+# in-character brush-off and NOTHING ELSE. No model call, so no matter how many
+# people DM her it costs $0 in API spend. The link is the server invite.
+DM_INVITE_URL = "https://discord.gg/fMtS77XbFe"
+DM_REPLY = (
+    "mm, no — i don't do private little chats out here. "
+    f"come find me in zamalko's server if you wanna talk: {DM_INVITE_URL}"
+)
+
 # Vision: incoming images Molly can actually see (Claude-supported formats only).
 MAX_IMAGES = 8  # per message, to bound request size/cost
 SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
@@ -1278,6 +1288,18 @@ async def on_message(message: discord.Message) -> None:
     # replied to (the API rejects message.reply on a system message), so treating
     # one as a normal message would crash the handler. Threads emit a lot of these.
     if message.is_system():
+        return
+
+    # NO DMs. She lives in Zamalko's server and only talks there. A message with no
+    # guild is a 1:1 DM (or group DM) — even if it @-mentions her. Answer every one
+    # with the same canned redirect and bail BEFORE any model call, so the whole DM
+    # surface costs nothing in API spend no matter how many people slide in. This is
+    # checked before the height/mention gates so it short-circuits everything.
+    if message.guild is None:
+        try:
+            await message.channel.send(DM_REPLY)
+        except discord.HTTPException:
+            pass
         return
 
     # Zamalko's height control. Checked before the home-channel/mention gate so
