@@ -89,9 +89,15 @@ FORGET_TAG_RE = re.compile(r"\[forget:\s*([^\]]+?)\s*\]", re.IGNORECASE)
 # Private-thread tags. "[thread: title]" opens a private thread off her channel
 # (owner + requester are pulled in automatically); "[thread: title | Bob, Carol]"
 # also invites the named people. "[invite: Bob]" adds people to the thread she's
-# already in. Names are resolved leniently (see resolve_invitee).
+# already in. "[rename: title]" renames the thread she's currently in (one she
+# created, or one she's been asked to rename). Names are resolved leniently
+# (see resolve_invitee).
 THREAD_TAG_RE = re.compile(r"\[thread:\s*([^\]]+?)\s*\]", re.IGNORECASE)
 INVITE_TAG_RE = re.compile(r"\[invite:\s*([^\]]+?)\s*\]", re.IGNORECASE)
+RENAME_TAG_RE = re.compile(r"\[rename:\s*([^\]]+?)\s*\]", re.IGNORECASE)
+# Em dash, en dash, horizontal bar, figure dash — Molly must never use any of
+# them; strip_dashes swaps them for a comma in everything she posts.
+DASH_RE = re.compile(r"\s*[—–―‒]\s*")
 # Creep brake. Molly appends "[disengage]" when she's been genuinely creeped on
 # (see CREEP_* constants and molly_prompt.py). It's stripped from what users see;
 # the bot uses it to wipe context / escalate to a mute.
@@ -250,24 +256,40 @@ def build_request_messages(history: deque) -> list[dict]:
     return request_messages
 
 
+def strip_dashes(text: str) -> str:
+    """Enforce the no-em/en-dash rule on anything Molly posts.
+
+    The prompt tells her not to use them, but the model still slips one in now and
+    then, so this is the hard backstop: every em/en dash (and the rarer horizontal
+    bar / figure dash) becomes a comma — the role they usually play as a pause —
+    and any doubled-up comma or stray space-before-comma the swap creates is tidied.
+    """
+    text = DASH_RE.sub(", ", text)
+    text = re.sub(r",\s*,+", ",", text)   # ", ," -> ","
+    text = re.sub(r"\s+,", ",", text)     # " ,"  -> ","
+    return text
+
+
 def parse_actions(
     reply_text: str,
 ) -> tuple[
     str, list[str], str | None, list[str], list[str], list[str],
-    tuple[str, list[str]] | None, list[str], bool,
+    tuple[str, list[str]] | None, list[str], str | None, bool,
 ]:
     """Pull Molly's inline action tags out of her reply.
 
     Returns (clean_text, reactions, gif_query, sticker_names, remembers, forgets,
-    thread_request, invites, disengaged): the message the users actually see, up to
-    MAX_REACTIONS emoji to react with, an optional GIF search query (the last
-    [gif:...] tag wins if she emits more than one), up to MAX_STICKERS
-    server-sticker names to attach, the raw bodies of any [remember:...] /
-    [forget:...] memory tags, an optional (title, [extra invitee names]) private
-    thread to open (the first [thread:...] tag wins), any [invite:...] names
-    to add to the current thread, and whether she emitted [disengage] (the creep
-    brake — see deliver_reply). Threads/invites are resolved and performed later
-    by process_thread_ops.
+    thread_request, invites, rename_request, disengaged): the message the users
+    actually see, up to MAX_REACTIONS emoji to react with, an optional GIF search
+    query (the last [gif:...] tag wins if she emits more than one), up to
+    MAX_STICKERS server-sticker names to attach, the raw bodies of any
+    [remember:...] / [forget:...] memory tags, an optional (title, [extra invitee
+    names]) private thread to open (the first [thread:...] tag wins), any
+    [invite:...] names to add to the current thread, an optional new title for the
+    current thread ([rename:...], the last one wins), and whether she emitted
+    [disengage] (the creep brake — see deliver_reply). Threads/invites/renames are
+    resolved and performed later by process_thread_ops. clean_text has em/en dashes
+    stripped (see strip_dashes).
     """
     disengaged = bool(DISENGAGE_TAG_RE.search(reply_text))
     reactions = [m.strip() for m in REACT_TAG_RE.findall(reply_text)][:MAX_REACTIONS]
@@ -290,25 +312,33 @@ def parse_actions(
     invites: list[str] = []
     for body in INVITE_TAG_RE.findall(reply_text):
         invites.extend(n.strip() for n in re.split(r"[;,]", body) if n.strip())
+    # Last [rename:...] wins — the new title for the thread she's currently in.
+    rename_matches = RENAME_TAG_RE.findall(reply_text)
+    rename_request = rename_matches[-1].strip() if rename_matches else None
 
-    clean_text = DISENGAGE_TAG_RE.sub(
+    clean_text = RENAME_TAG_RE.sub(
         "",
-        INVITE_TAG_RE.sub(
+        DISENGAGE_TAG_RE.sub(
             "",
-            THREAD_TAG_RE.sub(
+            INVITE_TAG_RE.sub(
                 "",
-                FORGET_TAG_RE.sub(
+                THREAD_TAG_RE.sub(
                     "",
-                    REMEMBER_TAG_RE.sub(
+                    FORGET_TAG_RE.sub(
                         "",
-                        STICKER_TAG_RE.sub(
-                            "", GIF_TAG_RE.sub("", REACT_TAG_RE.sub("", reply_text))
+                        REMEMBER_TAG_RE.sub(
+                            "",
+                            STICKER_TAG_RE.sub(
+                                "", GIF_TAG_RE.sub("", REACT_TAG_RE.sub("", reply_text))
+                            ),
                         ),
                     ),
                 ),
             ),
         ),
     )
+    # Em/en dashes are banned — swap them out before tidying whitespace.
+    clean_text = strip_dashes(clean_text)
     # Pulling a tag from mid-sentence can leave a double space; collapse runs of
     # spaces/tabs first.
     clean_text = re.sub(r"[ \t]{2,}", " ", clean_text)
@@ -320,7 +350,7 @@ def parse_actions(
     clean_text = re.sub(r"\n[ \t]*(?:\n[ \t]*)+", "\n", clean_text).strip()
     return (
         clean_text, reactions, gif_query, sticker_names, remembers, forgets,
-        thread_request, invites, disengaged,
+        thread_request, invites, rename_request, disengaged,
     )
 
 
@@ -847,14 +877,18 @@ async def process_thread_ops(
     requester,
     thread_request: "tuple[str, list[str]] | None",
     invites: list[str],
+    rename_request: "str | None" = None,
 ) -> None:
-    """Open private threads / add people, from Molly's [thread:]/[invite:] tags.
+    """Open private threads / add people / rename, from Molly's thread tags.
 
     Runs after the visible reply is sent and swallows its own errors, so a Discord
     hiccup can never break the message — same spirit as process_memory_ops.
 
     - [invite: name] adds people to the CURRENT thread (only meaningful when this
       message is already in a thread).
+    - [rename: title] renames the CURRENT thread (one Molly created, or one she's
+      been asked to rename). Only meaningful when this message is in a thread; she
+      can rename it because the bot owns the threads it creates.
     - [thread: title | names] opens a PRIVATE thread off the home channel and
       pulls people in, ALWAYS in this order: the owner first, then the requester
       (the person Molly's replying to), then any explicitly-named extras. That
@@ -865,6 +899,15 @@ async def process_thread_ops(
     guild = message.guild
     if guild is None:
         return
+
+    # Rename the thread Molly is currently in. Discord caps thread names; trim to
+    # the same margin as creation. Non-fatal — a failed rename mustn't break the reply.
+    if rename_request and isinstance(message.channel, discord.Thread):
+        new_name = rename_request[:THREAD_NAME_MAX]
+        try:
+            await message.channel.edit(name=new_name)
+        except Exception as exc:  # noqa: BLE001 — a failed rename must not kill the reply
+            print(f"[thread] rename to {new_name!r} failed: {exc}")
 
     # Add people to the thread Molly is already in.
     if invites and isinstance(message.channel, discord.Thread):
@@ -1582,7 +1625,7 @@ async def deliver_reply(
     """
     (
         clean_text, reactions, gif_query, sticker_names, remembers, forgets,
-        thread_request, invites, disengaged,
+        thread_request, invites, rename_request, disengaged,
     ) = parse_actions(reply_text)
     guild = message.guild
 
@@ -1648,7 +1691,9 @@ async def deliver_reply(
     # Private-thread actions, after the visible reply. The requester (who gets
     # pulled in after the owner) is the current human speaker — memory_subject —
     # which is message.author in the normal path. Swallows its own errors.
-    await process_thread_ops(message, memory_subject, thread_request, invites)
+    await process_thread_ops(
+        message, memory_subject, thread_request, invites, rename_request
+    )
 
     # Persist any memory tags last, so a slow/failed DB write can never hold up
     # or break the visible reply (process_memory_ops also swallows its own errors).

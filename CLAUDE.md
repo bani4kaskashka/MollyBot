@@ -273,7 +273,16 @@ the visible reply, errors swallowed — same fire-and-forget pattern as
 - **Triggers**: someone asks to "talk in private" / "make a thread" → `[thread:
   title]`. The owner saying "make a thread with me and Bob" → `[thread: title |
   Bob]` (extras after the pipe). Inside a thread, "can you add Bob" → `[invite:
-  Bob]`.
+  Bob]`. Inside a thread, "rename this to X" (or her own offer when the topic has
+  drifted, accepted) → `[rename: X]`.
+- **Renaming** (`[rename: title]`): handled at the top of `process_thread_ops` —
+  when the message is in a `discord.Thread`, `message.channel.edit(name=...)`
+  (trimmed to `THREAD_NAME_MAX`). Works on threads she created (the bot owns
+  them) and degrades to a logged no-op if Discord refuses (e.g. a thread she
+  doesn't manage). The prompt (PRIVATE THREADS section) drives both the
+  on-request rename and the *occasional* "want me to rename this to …?" offer
+  when a thread's theme has clearly shifted — she asks first and only emits the
+  tag once they agree, never unprompted. Last `[rename:]` tag wins.
 - **Who gets added, in order**: the **owner always first** (the `HEIGHT_CONTROLLER`
   handle, via `resolve_owner_member`, cached per guild), then the **requester**
   (the current human speaker — `memory_subject`, i.e. `message.author`), then any
@@ -313,7 +322,8 @@ Molly emits private tags in her reply text; `parse_actions` strips them out
   persistent-memory section above.
 - `[thread: title]` / `[thread: title | Name1, Name2]` — open a **private** thread
   off the home channel; `[invite: Name]` — add people to the thread she's already
-  in. See the private-threads section below.
+  in; `[rename: title]` — rename the thread she's currently in. See the
+  private-threads section above.
 - `:custom_name:` in body text — replaced with real `<:name:id>` markup for the
   server's custom emoji (these *do* render in chat; unknown names stay as text).
 
@@ -321,6 +331,12 @@ The list of usable server emoji/sticker names is injected into the system prompt
 each turn by `build_emoji_sticker_note`. How freely she uses reactions/GIFs is
 governed by the prompt wording in `molly_prompt.py` **and** the hard caps in
 `bot.py` — tune both together.
+
+**No em/en dashes.** A HARD RULE in `molly_prompt.py` forbids them in her output,
+and `strip_dashes` (applied to `clean_text` inside `parse_actions`, so it covers
+every model-call path — normal replies, the height jolt, reaction replies, and
+thread openers) is the code-level backstop: it swaps any `—`/`–` (plus the rarer
+`―`/`‒`) for a comma and tidies the result. Plain in-word hyphens are left alone.
 
 ## Conventions
 
