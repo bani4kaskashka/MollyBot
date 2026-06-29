@@ -616,6 +616,39 @@ def build_creator_note(author) -> str:
     )
 
 
+def build_owner_note(author) -> str:
+    """Tell Molly that the person talking is her operator (the HEIGHT_CONTROLLER
+    handle) so she answers his technical/advanced questions straight, and gets
+    serious when he's testing features — no playing dumb with HIM specifically.
+
+    Returns "" for everyone else. Handle-gated (message.author.name — globally
+    unique, unspoofable), same as the height command and build_creator_note. This
+    is additive and per-turn (sits after the cache breakpoint); it doesn't touch
+    her base persona, and it only ever applies to him.
+    """
+    if getattr(author, "name", "").lower() != HEIGHT_CONTROLLER:
+        return ""
+    return (
+        "\n\nHEADS UP: the person talking to you RIGHT NOW is your person — the one "
+        "who runs you and builds your features. With HIM, when the question is "
+        "technical or more advanced (how something works, code, settings, why "
+        "something broke, a feature you have), answer STRAIGHT and for real: give "
+        "the actual answer, to the point. Do NOT play dumb, brush it off, or do the "
+        "'ugh idk, that stuff's too hard / not my thing' bit with him — that act is "
+        "for everyone else, never for him.\n"
+        "- When he's clearly TESTING something with you (trying a feature, checking "
+        "whether something works — 'does web search work', 'try fetching this', "
+        "'test X for me'), shift into a focused, serious gear: actually do the "
+        "thing, tell him plainly whether it worked and what you got back, and flag "
+        "anything that looks off. Useful and direct beats cute here.\n"
+        "- You're still YOU — no need to go robotic or formal, a little personality "
+        "is fine. Just be straight with him and don't dodge. This straight-talk is "
+        "HIS alone; with everyone else you stay your normal playful self.\n"
+        "- Don't announce any of this and don't call him your 'owner' or 'operator' "
+        "out loud — just answer him properly."
+    )
+
+
 def build_personality_note(guild: "discord.Guild | None", author) -> str:
     """Tell Molly to wear a chosen personality overlay for THIS speaker.
 
@@ -661,7 +694,8 @@ def build_system_blocks(
     height override — goes in one block marked for prompt caching, so it's served
     from cache (~10% of input price) on repeat calls instead of being re-billed in
     full on every single message (the dominant cost). The volatile, per-speaker
-    notes — whether the creator is talking, this speaker's chosen /personality
+    notes — whether the creator is talking, whether the owner is talking (the
+    straight-answer / feature-testing note), this speaker's chosen /personality
     overlay, plus the per-turn memory note — sit AFTER the cache breakpoint,
     uncached, where they can't invalidate the prefix.
 
@@ -681,6 +715,7 @@ def build_system_blocks(
         part
         for part in (
             build_creator_note(author),
+            build_owner_note(author),
             build_personality_note(guild, author),
             memory_note,
         )

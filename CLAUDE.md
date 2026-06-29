@@ -39,7 +39,18 @@ The bot is three files:
 - `HEIGHT_CONTROLLER` — **optional**. Discord **handle** (`message.author.name`,
   not the per-server nickname) allowed to use the height command; defaults to
   `ca11mebucky`. Gating on the handle is deliberate — it's globally unique and
-  unspoofable, whereas anyone can copy a nickname.
+  unspoofable, whereas anyone can copy a nickname. This handle is also the **owner**
+  for two other things: the owner-only slash commands (`/mollynewchat`,
+  `/mollythreadrename`) and the **owner straight-answer note** — when this handle is
+  the one talking, `build_owner_note` injects a per-turn note (same handle-gated,
+  unspoofable, after-the-cache-breakpoint mechanism as `build_creator_note`) telling
+  Molly to answer *his* technical/advanced questions straight — no "ugh idk that's
+  too hard" playing-dumb — and to shift into a focused, serious gear when he's
+  testing a feature (report plainly whether it worked, what came back, what's off).
+  It's **his alone** (everyone else gets normal playful Molly), additive, and does
+  **not** override the HARD RULES or rewrite her persona. Distinct from the creator
+  note: that one (`MOLLY_CREATOR`/Zamalko) is about absolute deference/canon; this
+  one is about technical straight-talk and feature-test seriousness.
 - `MOLLY_CREATOR` — **optional**. Discord **handle** of Molly's creator (Zamalko);
   defaults to `zamalkogts`. When this handle is the one talking to her,
   `build_creator_note` injects a per-turn note that (a) makes her address him
