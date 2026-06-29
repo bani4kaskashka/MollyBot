@@ -55,6 +55,14 @@ REACTION_REPLY_COOLDOWN = 45
 # Floor between Molly opening private threads in a channel, so "make a thread" can't
 # be spam-summoned (every thread also pings the owner, so this matters).
 THREAD_COOLDOWN_SECONDS = 30
+# Stale-history replay guard. Short-term history is shared per channel and re-sent
+# every turn (and re-seeded by prime_channel_context), so an old "make a thread"
+# line lingering in the scrollback can make the small model re-fire [thread:] on a
+# later, unrelated turn — opening a duplicate thread nobody just asked for. We skip
+# a creation whose (requester + named-extras) signature matches one opened within
+# this window. (The molly_prompt.py PRIVATE THREADS rule "act only on the current
+# message" is the matching prompt-side guard; this is the deterministic backstop.)
+THREAD_DEDUPE_SECONDS = 300
 # Creep handling. When Molly emits the [disengage] tag she's flagging GENUINE,
 # full-on creep behaviour — sexual pushing, dominance/submission, "do this with
 # your body" — NOT jokes or normal flirting (the line is drawn in molly_prompt.py).
@@ -164,6 +172,10 @@ last_gif_at: dict[int, float] = {}
 # Per-channel timestamp (monotonic) of the last private thread Molly opened, for
 # the THREAD_COOLDOWN_SECONDS floor.
 last_thread_at: dict[int, float] = {}
+# Per-channel (monotonic time, request signature) of the last thread opened, for the
+# THREAD_DEDUPE_SECONDS stale-history replay guard. Signature is
+# (requester_id, frozenset(lowercased extra-invitee names)).
+last_thread_sig: dict[int, "tuple[float, tuple]"] = {}
 # Per-channel current height (cm) set by Zamalko's control command. Held in
 # memory only and NEVER written to history, so it colours how Molly acts in the
 # moment without becoming something she "remembers" or repeats. Resets on
@@ -1022,6 +1034,20 @@ async def process_thread_ops(
 
     title, extra_names = thread_request
     title = (title or "molly chat")[:THREAD_NAME_MAX]
+    # Stale-history replay guard: if she's re-firing the SAME request (same requester
+    # + same named extras) that already opened a thread within THREAD_DEDUPE_SECONDS,
+    # it's almost certainly an old "make a thread" line in the re-sent scrollback, not
+    # a fresh ask — skip it so she doesn't spawn duplicate threads nobody just asked
+    # for. See THREAD_DEDUPE_SECONDS.
+    sig = (
+        getattr(requester, "id", None),
+        frozenset(n.lower() for n in extra_names),
+    )
+    prev = last_thread_sig.get(message.channel.id)
+    if prev is not None and prev[1] == sig and now - prev[0] < THREAD_DEDUPE_SECONDS:
+        print(f"[thread] skipped duplicate request {sig} (stale-history replay guard)")
+        return
+
     try:
         thread = await message.channel.create_thread(
             name=title,
@@ -1032,6 +1058,7 @@ async def process_thread_ops(
         print(f"[thread] create failed: {exc}")
         return
     last_thread_at[message.channel.id] = now
+    last_thread_sig[message.channel.id] = (now, sig)
 
     # Build the invite list in the required order, de-duped: owner, requester, extras.
     ordered: list = []

@@ -326,6 +326,22 @@ the visible reply, errors swallowed — same fire-and-forget pattern as
   CHANNEL_ID`): threads can't nest, and a thread under home counts as home
   (`is_home_channel` via `parent_id`) so she talks freely in it with no ping.
   Per-channel `THREAD_COOLDOWN_SECONDS` floor so it can't be spam-summoned.
+- **Stale-history replay guard (`THREAD_DEDUPE_SECONDS`).** Short-term history is
+  shared per channel and re-sent every turn (and re-seeded by
+  `prime_channel_context`), so an old "make a thread with me and X" line lingering
+  in the 30-message scrollback can make the small model **re-fire `[thread:]` on a
+  later, unrelated turn** and open a duplicate thread nobody just asked for (a real
+  bug seen in the wild). Two guards: (1) a prompt rule in `molly_prompt.py`'s
+  PRIVATE THREADS section — *act only on the message in front of you, never on an
+  older thread ask up in the chat or in backlog you're catching up on*; and (2) a
+  deterministic backstop in `process_thread_ops` — `last_thread_sig` records the
+  `(requester_id, frozenset(lowercased extra-invitee names))` of the last thread
+  opened per channel, and a creation matching that signature within
+  `THREAD_DEDUPE_SECONDS` (default 300s) is **skipped**. The prompt guard reduces
+  the first stray fire; the dedupe kills the repeat. Trade-off: the same person
+  legitimately asking for a thread with the *same* people inside the window is also
+  skipped (rare; widen the window or clear the signature if it bites). In-memory,
+  per-run, resets on restart — same as the cooldown.
 - **Context carry-over** is backend (no synopsis pasted): `seed_thread_context`
   copies the parent channel's history deque + recent-speakers window into the new
   thread and marks it primed, so she continues exactly where she was and stored
