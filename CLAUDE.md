@@ -41,7 +41,7 @@ The bot is three files:
   `ca11mebucky`. Gating on the handle is deliberate — it's globally unique and
   unspoofable, whereas anyone can copy a nickname. This handle is also the **owner**
   for two other things: the owner-only slash commands (`/mollynewchat`,
-  `/mollythreadrename`) and the **owner straight-answer note** — when this handle is
+  `/mollythreadrename`, `/mollyforgive`) and the **owner straight-answer note** — when this handle is
   the one talking, `build_owner_note` injects a per-turn note (same handle-gated,
   unspoofable, after-the-cache-breakpoint mechanism as `build_creator_note`) telling
   Molly to answer *his* technical/advanced questions straight — no "ugh idk that's
@@ -214,6 +214,38 @@ ephemeral brush-off.
   one / can't rename this" miss). The rename itself is best-effort: a failed model
   call or a Discord refusal (e.g. no Manage Threads on a thread she didn't create)
   just yields the miss reply, never an error.
+
+### Creep brake (the `[disengage]` tag) + `/mollyforgive`
+
+Molly's defence against genuine sexual/dominance/"do X with your body" pushing.
+She emits `[disengage]` (prompt: HARD RULES "CREEP BRAKE" in `molly_prompt.py`);
+`handle_creep_disengage` performs the mechanical response. Behaviour is a
+**deliberately gentle** balance — the prompt wording is written to fire ONLY on a
+clear, genuine creep and to explicitly ignore typos, emoji, jokes, and normal
+flirting, because on the small model an over-aggressive brake was muting people
+who were just chatting.
+
+- **What firing does** (per offender, keyed `(channel_id, user_id)`, all RAM-only):
+  wipes the channel's short-term history (same reset as `/mollynewchat`, so the
+  creepy turns stop poisoning her context — durable memory is untouched), and puts
+  them on a **break** where `on_message` silently doesn't answer them (an internal
+  ignore, **NOT** a Discord mute — they can still talk). One "i'm on a break" line
+  is sent, then silence until it lapses.
+- **Escalation / durations** live in `bot.py` constants and `creep_break_seconds`:
+  1st strike = `CREEP_MUTE_SECONDS` (**5 min**), 2nd+ = 3× (**15 min**). The offense
+  count decays after `CREEP_STRIKE_WINDOW` (**15 min**) of calm → a later slip is a
+  fresh 1st strike. `creep_break_seconds` is the single source of truth so the
+  `build_creep_note` prompt hint ("the break will be X") and the actual mute can't
+  drift; `humanize_duration` formats it. (These were dialled back from an earlier
+  15min/1hr — tune the prompt eagerness AND these together, same as GIFs/reactions.)
+- **Owner/creator never get a break** (a misfired `[disengage]` mustn't lock them
+  out), gated on their unspoofable handles.
+- **`/mollyforgive @user`** (owner-only slash command) is the manual undo for a
+  misfire: it clears that user's **entire** creep record — active mute, offense
+  count, and decay timer — across **every** channel (drops every creep-state entry
+  for their user id, not just the current channel), so they're clean everywhere.
+  Gated to the `HEIGHT_CONTROLLER` handle like `/mollynewchat`; ephemeral
+  in-character confirmation (reports whether there was actually anything to lift).
 
 ### `/personality` + `/resetpersonality` slash commands (any user)
 

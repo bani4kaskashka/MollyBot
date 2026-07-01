@@ -66,17 +66,21 @@ THREAD_COOLDOWN_SECONDS = 30
 THREAD_DEDUPE_SECONDS = 300
 # Creep handling. When Molly emits the [disengage] tag she's flagging GENUINE,
 # full-on creep behaviour — sexual pushing, dominance/submission, "do this with
-# your body" — NOT jokes or normal flirting (the line is drawn in molly_prompt.py).
-# Escalation is per-offender:
+# your body" — NOT jokes, typos, emoji, or normal flirting (the line is drawn in
+# molly_prompt.py, which is deliberately un-trigger-happy so ordinary chat doesn't
+# trip it). Escalation is per-offender:
 #   - 1st offense: her short-term history for the channel is wiped so the creepy
 #     turns can't keep poisoning her context (the same reset /mollynewchat does),
-#     she gives one "i'm stepping away" brush-off, and is immediately put on a
-#     CREEP_MUTE_SECONDS (15-minute) break where she won't reply.
-#   - 2nd offense and EVERY one after: same reset, plus an escalated 1-hour break.
+#     she gives one "i'm stepping away" brush-off, and is put on a short
+#     CREEP_MUTE_SECONDS (5-minute) break where she won't reply.
+#   - 2nd offense and EVERY one after: same reset, plus an escalated break
+#     (creep_break_seconds → 3x, i.e. 15 minutes).
 # The offense count decays: if someone behaves for CREEP_STRIKE_WINDOW, their next
-# slip is treated as a fresh 1st offense again.
-CREEP_MUTE_SECONDS = 900       # 15-minute break where she won't answer the offender
-CREEP_STRIKE_WINDOW = 1800     # calm for this long (30 minutes) and the offense count resets to 0
+# slip is treated as a fresh 1st offense again. Durations were dialled back from an
+# earlier 15min/1hr because innocuous chat was tripping the brake — keep them gentle,
+# and lift a wrongly-applied break with the owner's /mollyforgive.
+CREEP_MUTE_SECONDS = 300       # 5-minute break where she won't answer the offender (1st strike)
+CREEP_STRIKE_WINDOW = 900      # calm for this long (15 minutes) and the offense count resets to 0
 THREAD_NAME_MAX = 90  # Discord caps thread names at 100; leave margin
 # How many server emoji/sticker names to list in the prompt, to bound token use.
 MAX_PROMPT_EMOJIS = 60
@@ -684,6 +688,24 @@ def build_personality_note(guild: "discord.Guild | None", author) -> str:
     )
 
 
+def creep_break_seconds(strike: int) -> int:
+    """Break length (seconds) for a given 1-based creep strike count. The 1st
+    strike is the base CREEP_MUTE_SECONDS; every strike after is 3x that. Single
+    source of truth so build_creep_note (the "state the duration" note) and
+    handle_creep_disengage (the actual mute) can't drift apart.
+    """
+    return CREEP_MUTE_SECONDS if strike <= 1 else CREEP_MUTE_SECONDS * 3
+
+
+def humanize_duration(seconds: int) -> str:
+    """"5 minutes" / "1 hour" style label for a break length, for the prompt note."""
+    mins = int(round(seconds / 60.0))
+    if mins >= 60 and mins % 60 == 0:
+        hrs = mins // 60
+        return f"{hrs} hour" + ("s" if hrs != 1 else "")
+    return f"{mins} minute" + ("s" if mins != 1 else "")
+
+
 def build_creep_note(channel_id: int, author) -> str:
     """If the author has a history of creep offenses, calculate the duration of the
     next mute break and inject a system note reminding Molly to state it.
@@ -698,7 +720,7 @@ def build_creep_note(channel_id: int, author) -> str:
     if last is not None and now - last > CREEP_STRIKE_WINDOW:
         count = 0
     next_strike = count + 1
-    duration_str = "15 minutes" if next_strike == 1 else "1 hour"
+    duration_str = humanize_duration(creep_break_seconds(next_strike))
     name = getattr(author, "display_name", None) or "this user"
     return (
         f"\n\nCREEP BRAKE NOTE: If {name} is pushing sexual content, physical control, "
@@ -1480,6 +1502,45 @@ async def mollythreadrename(interaction: discord.Interaction) -> None:
 
 
 @tree.command(
+    name="mollyforgive",
+    description="Lift a user's creep timeout so Molly talks to them again. Owner only.",
+)
+@app_commands.describe(user="The person to forgive — clears their creep break and record.")
+async def mollyforgive(interaction: discord.Interaction, user: discord.Member) -> None:
+    """Owner-only: clear a user's creep-brake state so Molly answers them again.
+
+    The creep brake can misfire on a small model (a typo, an emoji, a bit of
+    edgy-but-harmless banter reading as a "creep push"), quietly muting someone
+    who was just chatting. This is the manual undo: pick the person and it wipes
+    their whole creep record — the active mute, the offense count, and the decay
+    timer — across EVERY channel (creep state is keyed per (channel, user), so we
+    drop every entry for this user id), so they start clean everywhere, not just
+    where the command was run. Gated to the same controller handle as the height
+    command and /mollynewchat (globally unique, unspoofable). Confirmation is
+    ephemeral, so forgiving someone doesn't post a notice into the channel.
+    """
+    if interaction.user.name.lower() != HEIGHT_CONTROLLER:
+        await interaction.response.send_message(
+            "nah, only my person gets to do that one :p", ephemeral=True
+        )
+        return
+    # Drop every creep entry for this user id, regardless of channel.
+    cleared = False
+    for store in (creep_offenses, creep_last_offense_at, creep_muted_until):
+        for k in [k for k in store if k[1] == user.id]:
+            del store[k]
+            cleared = True
+    for k in [k for k in creep_break_notified if k[1] == user.id]:
+        creep_break_notified.discard(k)
+    msg = (
+        f"aight, {user.display_name}'s off the hook, we're good again :3"
+        if cleared
+        else f"lol {user.display_name} wasn't on a break, nothing to forgive :p"
+    )
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+@tree.command(
     name="personality",
     description="Pick how Molly acts with you (just you — changes nothing for anyone else).",
 )
@@ -1960,13 +2021,14 @@ def handle_creep_disengage(message: discord.Message, offender) -> None:
     context — she's noticeably calmer reading a clean slate than re-reading the
     exchange. Durable per-user memory (memory.py) is left untouched.
 
-    Escalates per offender: the 1st offense puts them on a CREEP_MUTE_SECONDS
-    (15-minute) break immediately. The 2nd offense and EVERY one after each put
-    them on an escalated break (1 hour), during which on_message simply doesn't
-    answer them (an internal ignore, NOT a Discord mute). The count decays after
-    CREEP_STRIKE_WINDOW of calm, so a one-off slip much later starts fresh.
-    Owner/creator are never put on a break: a misfired [disengage] mustn't lock
-    them out. State is RAM-only (resets on restart).
+    Escalates per offender: the 1st offense puts them on a short CREEP_MUTE_SECONDS
+    (5-minute) break immediately. The 2nd offense and EVERY one after each put them
+    on an escalated break (15 minutes, see creep_break_seconds), during which
+    on_message simply doesn't answer them (an internal ignore, NOT a Discord mute).
+    The count decays after CREEP_STRIKE_WINDOW of calm, so a one-off slip much later
+    starts fresh. Owner/creator are never put on a break: a misfired [disengage]
+    mustn't lock them out, and the owner can lift any wrong break with /mollyforgive.
+    State is RAM-only (resets on restart).
     """
     channel_id = message.channel.id
     key = (channel_id, offender.id)
@@ -1995,9 +2057,8 @@ def handle_creep_disengage(message: discord.Message, offender) -> None:
     handle = (getattr(offender, "name", "") or "").lower()
     is_privileged = handle in (HEIGHT_CONTROLLER, MOLLY_CREATOR)
     if count >= 1 and not is_privileged:
-        # 1st strike is 15 minutes; subsequent strikes are 1 hour (60 minutes)
-        duration = CREEP_MUTE_SECONDS if count == 1 else CREEP_MUTE_SECONDS * 4
-        creep_muted_until[key] = now + duration
+        # 1st strike is the base break; subsequent strikes escalate (see helper).
+        creep_muted_until[key] = now + creep_break_seconds(count)
         creep_break_notified.discard(key)
 
 
