@@ -100,17 +100,54 @@ _UNICODE_EMOJI_RE = re.compile(
     flags=re.UNICODE,
 )
 
-# yt-dlp: grab the best audio-only stream, no playlists, quiet. ytsearch1 turns a
-# plain phrase into the top YouTube hit; a bare URL is used as-is.
-_YTDL_OPTS = {
-    "format": "bestaudio/best",
-    "noplaylist": True,
-    "quiet": True,
-    "no_warnings": True,
-    "default_search": "ytsearch",
-    "source_address": "0.0.0.0",
-    "cachedir": False,
-}
+# YouTube blocks datacenter IPs (Railway's) with "Sign in to confirm you're not a
+# bot". Two levers, both env-configurable:
+#  1. player_client override — ask yt-dlp for client types that dodge the check
+#     without login. Free, no setup, but YouTube plays whack-a-mole so it's not
+#     guaranteed. Override the tried clients with YTDLP_PLAYER_CLIENTS (comma-sep).
+#  2. Cookies — a logged-in YouTube session so requests look like a real user; the
+#     durable fix on a server IP. Provide EITHER the cookies.txt *contents* in
+#     YOUTUBE_COOKIES (handy on Railway — paste into a variable) or a path in
+#     YTDLP_COOKIES_FILE. YOUTUBE_COOKIES is written to a temp file at import.
+_PLAYER_CLIENTS = [
+    c.strip()
+    for c in os.environ.get("YTDLP_PLAYER_CLIENTS", "tv,ios,web_safari,android").split(",")
+    if c.strip()
+]
+_COOKIES_FILE = os.environ.get("YTDLP_COOKIES_FILE")
+_cookies_inline = os.environ.get("YOUTUBE_COOKIES")
+if _cookies_inline and not _COOKIES_FILE:
+    try:
+        import tempfile
+        _fd, _COOKIES_FILE = tempfile.mkstemp(prefix="yt_cookies_", suffix=".txt")
+        with os.fdopen(_fd, "w") as _cf:
+            _cf.write(_cookies_inline)
+    except Exception as _exc:  # noqa: BLE001 — bad cookies must not stop the bot
+        print(f"[voice] could not write YOUTUBE_COOKIES to a temp file: {_exc}")
+        _COOKIES_FILE = None
+
+
+def _build_ytdl_opts() -> dict:
+    """yt-dlp options: best audio-only, no playlists, plus the datacenter-IP
+    workarounds (player_client override + cookies) when configured. Built per call
+    so env-driven cookies/clients apply without a code change.
+    """
+    opts = {
+        "format": "bestaudio/best",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "default_search": "ytsearch",
+        "source_address": "0.0.0.0",
+        "cachedir": False,
+    }
+    if _PLAYER_CLIENTS:
+        opts["extractor_args"] = {"youtube": {"player_client": _PLAYER_CLIENTS}}
+    if _COOKIES_FILE:
+        opts["cookiefile"] = _COOKIES_FILE
+    return opts
+
+
 # Reconnect flags matter for long YouTube streams; -vn drops any video.
 _FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 _FFMPEG_OPTS = "-vn"
@@ -174,6 +211,7 @@ def diagnose() -> str:
         parts.append(f"davey:FAIL({exc!r})")
     parts.append("ffmpeg:" + ("found" if shutil.which("ffmpeg") else "MISSING"))
     parts.append("yt-dlp:" + ("OK" if yt_dlp is not None else "MISSING"))
+    parts.append("yt-cookies:" + ("set" if _COOKIES_FILE else "none"))
     parts.append("tts-config:" + ("set" if enabled() else "unset"))
     return "[voice] deps — " + " | ".join(parts)
 
@@ -366,7 +404,7 @@ def _resolve_blocking(query: str) -> "dict | None":
     is_url = query.strip().lower().startswith(("http://", "https://"))
     target = query if is_url else f"ytsearch1:{query}"
     try:
-        with yt_dlp.YoutubeDL(_YTDL_OPTS) as ydl:
+        with yt_dlp.YoutubeDL(_build_ytdl_opts()) as ydl:
             info = ydl.extract_info(target, download=False)
     except Exception as exc:  # noqa: BLE001
         print(f"[voice] yt-dlp lookup failed for {query!r}: {exc}")
