@@ -8,13 +8,17 @@ MollyBot is a Discord bot that replies in character as **Molly Simpson**, a
 character from the visual novel *Molly's Favourite Toy* by Zamalko. It listens
 in a Discord server and generates replies with the Anthropic API.
 
-The bot is three files:
+The bot is these files:
 
 - `bot.py` — all the Discord + Anthropic wiring.
 - `molly_prompt.py` — `MOLLY_SYSTEM_PROMPT`, the character/persona and all the
   behavioral rules. **Tune Molly's personality and behavior here**, not in code.
 - `memory.py` — the MySQL layer for persistent per-user memory (see below). Pure
   mechanics; degrades to a no-op if the database isn't configured/reachable.
+- `voice.py` — the ElevenLabs TTS + Discord voice-playback layer (see the voice
+  section below). Pure mechanics, same graceful-no-op spirit as `memory.py`:
+  degrades to silent no-op if `ELEVENLABS_API_KEY`/`ELEVENLABS_VOICE_ID` aren't set
+  or the ffmpeg/PyNaCl deps are missing.
 
 `requirements.txt`, `Procfile`, `.python-version` (3.11) support deployment.
 
@@ -36,6 +40,16 @@ The bot is three files:
 - `CHANNEL_ID` — required. Molly's **home channel** (see below).
 - `KLIPY_API_KEY` — **optional**. Enables GIFs via the Klipy API (Google's Tenor
   API shut down in 2026). Without it, GIFs silently no-op and the bot still runs.
+- `ELEVENLABS_API_KEY` + `ELEVENLABS_VOICE_ID` — **optional** (both needed together).
+  Enable Molly's **voice** (see the voice section below): she joins a Discord voice
+  channel via the owner's `/mollyjoin` and speaks her replies aloud through the
+  ElevenLabs voice named by `ELEVENLABS_VOICE_ID`. Without **both** set, voice stays
+  off and everything runs exactly as before (text-only). `ELEVENLABS_MODEL` is an
+  optional third var (defaults to `eleven_flash_v2_5` — fastest and ~0.5 credits/char;
+  set `eleven_multilingual_v2` for top quality at 1 credit/char). Also needs the
+  **ffmpeg** binary (provided by `nixpacks.toml`) and **PyNaCl** (in
+  `requirements.txt`) at runtime — missing either disables playback but doesn't crash
+  the bot.
 - `HEIGHT_CONTROLLER` — **optional**. Discord **handle** (`message.author.name`,
   not the per-server nickname) allowed to use the height command; defaults to
   `ca11mebucky`. Gating on the handle is deliberate — it's globally unique and
@@ -88,7 +102,9 @@ Tunable constants live at the top of `bot.py` (`MODEL`, `MAX_TOKENS`,
 - **Permissions**: View Channels, Send Messages, Read Message History, Add
   Reactions, **Embed Links** (so posted GIF links unfurl), **Create Private
   Threads** + **Send Messages in Threads** (so `[thread:]`/`[invite:]` work —
-  without them thread creation silently fails and logs `[thread] create failed`).
+  without them thread creation silently fails and logs `[thread] create failed`),
+  and — for voice (`/mollyjoin`) — **Connect** + **Speak** in the voice channels
+  she should be able to join and talk in.
 - **Slash commands** need the bot invited with the **`applications.commands`**
   scope (in addition to `bot`). Without it `/mollynewchat` won't appear; re-invite
   with that scope ticked. The command is synced to Molly's own guild only (derived
@@ -440,6 +456,80 @@ the same response.
   an image-search API + a new key) is the planned follow-up for actually pulling
   pictures.
 
+### Voice channels — she speaks her replies (`voice.py`, `/mollyjoin`)
+
+Molly can sit in a Discord **voice channel**, say her replies out loud with an
+ElevenLabs TTS voice, and **play YouTube music** on request. This is **Phase 1** of
+voice: TTS + music (she *speaks* and *DJs*), no listening/wake-word yet. Optional
+and self-contained (`voice.py`), same graceful-no-op spirit as `memory.py`/GIFs —
+TTS is off unless `ELEVENLABS_API_KEY` **and** `ELEVENLABS_VOICE_ID` are set (and
+ffmpeg + PyNaCl present); music is off unless `yt-dlp` (+ ffmpeg) is present. Each
+degrades independently.
+
+- **Owner-driven join** (deliberate, per the maintainer's call — not auto-join).
+  `/mollyjoin` (owner-only, gated on the `HEIGHT_CONTROLLER` handle like the other
+  owner commands) connects her to **whatever VC the runner is currently in**;
+  `/mollyleave` disconnects. Both are ephemeral, in-character. She can only be in
+  one VC per guild (Discord's model); `join()` `move_to`s if already connected.
+- **What gets spoken**: the hook is a **single block in `deliver_reply`** — the same
+  central chokepoint every reply path flows through — so *any* reply she posts while
+  voice-connected in that guild (normal chat, reaction replies, the height jolt;
+  thread openers go through their own send but the main paths are covered) is also
+  voiced. It speaks `clean_text` (after tag-stripping), so users never hear literal
+  `[gif:]`/`[react:]` tags.
+- **Speech cleanup (emoticons/emoji stripped from the SPOKEN copy only)**:
+  `voice._clean_for_speech` runs on the text handed to TTS — NOT the text reply she
+  posts. It strips custom-emoji/mention markup (`<:wave:123>`), **text emoticons**
+  (`:3`, `xD`, `^^`, `<3`, `T_T`, `uwu`, …) and unicode emoji, all of which
+  ElevenLabs reads as ugly literal noise ("colon three", "ex dee"). She keeps using
+  them in **chat text** — this is purely a spoken-audio fix. The emoticon regex is
+  anchored to non-word boundaries so it leaves real words and clock times (`3:30`,
+  `8:00`) alone; a reply that was *only* an emoticon just isn't spoken that turn.
+- **Music (`[play:]`/`[skip:]`/`[stop]`, YouTube via yt-dlp)**: while she's in a
+  call she can DJ. She emits `[play: song name or link]` (searches YouTube herself —
+  she already has web search, but `[play:]` resolves via **yt-dlp**'s `ytsearch1`,
+  no link needed), `[skip]`, or `[stop]` (stop + clear queue). Prompt guidance lives
+  in `molly_prompt.py`'s **PLAYING MUSIC** section; `parse_actions` pulls the tags
+  and `deliver_reply` performs them against `guild.voice_client`. `voice.py` keeps a
+  tiny **per-guild queue** and advances on song-end via the ffmpeg `after` callback
+  (marshalled back to the loop). Music plays at `MUSIC_VOLUME` (0.6). A `[play:]`
+  request **preempts** in-progress TTS (one source per voice client), and while a
+  song is active `voice.speak` **steps aside** (she still replies in text) — tracked
+  by `voice.music_active()` off the `_now_playing` state. `/mollyleave` clears the
+  queue. Music is free (YouTube audio); it's a CPU/bandwidth cost, not an API bill.
+- **Fire-and-forget, never blocks**: `deliver_reply` schedules `voice.speak(...)` /
+  `voice.enqueue(...)` as background tasks (tracked in `bot.py`'s `audio_tasks` set
+  so they aren't GC'd) — synthesis/lookup + playback last as long as the audio, far
+  too long to hold the reply or the per-channel lock on. `voice.speak` **serializes
+  per guild** via a playback lock (awaits each clip's ffmpeg `after` callback, with a
+  `PLAYBACK_TIMEOUT_SECONDS` safety valve) so overlapping replies queue in order
+  instead of colliding ("Already playing audio"). Errors are swallowed — a TTS/music
+  failure never touches the text reply that already sent.
+- **Cost lever** (same "tune eagerness" caveat as GIFs/web search): ElevenLabs bills
+  **per character**. Defaults to the **Flash** model (`ELEVENLABS_MODEL`, ~0.5
+  credits/char, low latency) and clips each utterance at `MAX_TTS_CHARS` (600) —
+  she still POSTS the full text, only the spoken version is capped. Continuous
+  listening is intentionally NOT here (it would be the expensive always-on part);
+  see the next-steps note.
+- **`build_voice_note`** (in `bot.py`, appended to the volatile/uncached part of the
+  system prompt) tells her when she's *currently in a call* — so she knows her
+  replies are spoken and that the PLAYING MUSIC rules are live. It's per-turn (its
+  truth flips with `/mollyjoin`/`/mollyleave`), so it sits after the cache breakpoint
+  with the datetime/memory notes and never invalidates the cached persona prefix.
+- **Deps/deploy**: `PyNaCl` (Discord voice) + `yt-dlp` (music) in `requirements.txt`;
+  the **ffmpeg** binary via `nixpacks.toml` (`aptPkgs = ["ffmpeg"]`, additive on
+  Railway). Discord perms: **Connect** + **Speak**. The `voice_states` intent is
+  non-privileged and already on via `Intents.default()`, so `interaction.user.voice`
+  resolves the runner's current VC with no extra portal step.
+- **Not yet built: listening / "Hey Molly".** Phase 2 is voice *receive*
+  (`discord-ext-voice-recv` on discord.py, or a py-cord migration) + a wake-word
+  engine (Picovoice **Porcupine**, custom "Hey Molly" keyword — keeps always-on
+  listening off the expensive meter) + STT (Whisper/Deepgram). Phase 3 routes
+  transcribed voice commands into the existing action-tag system (the `[play:]` etc.
+  tags already exist; "post this there" would be new). ElevenLabs STT (330
+  credits/min) is the wrong tool for the always-on listen — reserve ElevenLabs for
+  the TTS voice only.
+
 ### Inline action tags (the key convention)
 
 Molly emits private tags in her reply text; `parse_actions` strips them out
@@ -457,6 +547,10 @@ Molly emits private tags in her reply text; `parse_actions` strips them out
   off the home channel; `[invite: Name]` — add people to the thread she's already
   in; `[rename: title]` — rename the thread she's currently in. See the
   private-threads section above.
+- `[play: song or link]` — queue a YouTube track in the voice call she's in;
+  `[skip]` — skip the current song; `[stop]` — stop the music and clear the queue.
+  Performed in `deliver_reply` (no-op unless she's voice-connected). See the voice
+  section above.
 - `:custom_name:` in body text — replaced with real `<:name:id>` markup for the
   server's custom emoji (these *do* render in chat; unknown names stay as text).
 

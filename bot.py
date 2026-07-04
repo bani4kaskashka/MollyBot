@@ -23,6 +23,7 @@ from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
 
 import memory
+import voice
 from molly_prompt import MOLLY_SYSTEM_PROMPT, PERSONALITIES
 
 load_dotenv()
@@ -123,6 +124,12 @@ FORGET_TAG_RE = re.compile(r"\[forget:\s*([^\]]+?)\s*\]", re.IGNORECASE)
 THREAD_TAG_RE = re.compile(r"\[thread:\s*([^\]]+?)\s*\]", re.IGNORECASE)
 INVITE_TAG_RE = re.compile(r"\[invite:\s*([^\]]+?)\s*\]", re.IGNORECASE)
 RENAME_TAG_RE = re.compile(r"\[rename:\s*([^\]]+?)\s*\]", re.IGNORECASE)
+# Music tags (see voice.py). "[play: song or link]" queues a YouTube track in the
+# voice call she's in; "[skip]" skips the current one; "[stop]" stops and clears
+# the queue. Only meaningful while she's connected to a voice channel.
+PLAY_TAG_RE = re.compile(r"\[play:\s*([^\]]+?)\s*\]", re.IGNORECASE)
+SKIP_TAG_RE = re.compile(r"\[skip\]", re.IGNORECASE)
+STOP_TAG_RE = re.compile(r"\[stop\]", re.IGNORECASE)
 # Em dash, en dash, horizontal bar, figure dash — Molly must never use any of
 # them; strip_dashes swaps them for a comma in everything she posts.
 DASH_RE = re.compile(r"\s*[—–―‒]\s*")
@@ -195,6 +202,11 @@ molly_heights: dict[int, int] = {}
 user_personalities: dict[tuple[int, int], str] = {}
 # Per-channel cooldown clock for replying to reactions on her own messages.
 last_reaction_reply_at: dict[int, float] = {}
+# Strong refs to in-flight voice audio tasks (TTS speech + music playback).
+# deliver_reply fires these off as background tasks (audio lasts far longer than
+# a reply should block the channel lock), so we keep a reference until each
+# finishes — without one the event loop could garbage-collect a task mid-playback.
+audio_tasks: set[asyncio.Task] = set()
 
 # Creep handling state, keyed by (channel_id, user_id). creep_offenses counts how
 # many times a user has tripped the creep brake (decays after CREEP_STRIKE_WINDOW
@@ -307,23 +319,30 @@ def parse_actions(
 ) -> tuple[
     str, list[str], str | None, list[str], list[str], list[str],
     tuple[str, list[str]] | None, list[str], str | None, bool,
+    str | None, bool, bool,
 ]:
     """Pull Molly's inline action tags out of her reply.
 
     Returns (clean_text, reactions, gif_query, sticker_names, remembers, forgets,
-    thread_request, invites, rename_request, disengaged): the message the users
-    actually see, up to MAX_REACTIONS emoji to react with, an optional GIF search
-    query (the last [gif:...] tag wins if she emits more than one), up to
-    MAX_STICKERS server-sticker names to attach, the raw bodies of any
-    [remember:...] / [forget:...] memory tags, an optional (title, [extra invitee
-    names]) private thread to open (the first [thread:...] tag wins), any
-    [invite:...] names to add to the current thread, an optional new title for the
-    current thread ([rename:...], the last one wins), and whether she emitted
-    [disengage] (the creep brake — see deliver_reply). Threads/invites/renames are
-    resolved and performed later by process_thread_ops. clean_text has em/en dashes
+    thread_request, invites, rename_request, disengaged, play_query, skip_music,
+    stop_music): the message the users actually see, up to MAX_REACTIONS emoji to
+    react with, an optional GIF search query (the last [gif:...] tag wins if she
+    emits more than one), up to MAX_STICKERS server-sticker names to attach, the
+    raw bodies of any [remember:...] / [forget:...] memory tags, an optional
+    (title, [extra invitee names]) private thread to open (the first [thread:...]
+    tag wins), any [invite:...] names to add to the current thread, an optional new
+    title for the current thread ([rename:...], the last one wins), whether she
+    emitted [disengage] (the creep brake — see deliver_reply), an optional
+    [play:...] music query (last one wins), and whether she emitted [skip]/[stop]
+    for music. Threads/invites/renames are resolved by process_thread_ops; music
+    tags are performed in deliver_reply (see voice.py). clean_text has em/en dashes
     stripped (see strip_dashes).
     """
     disengaged = bool(DISENGAGE_TAG_RE.search(reply_text))
+    play_matches = PLAY_TAG_RE.findall(reply_text)
+    play_query = play_matches[-1].strip() if play_matches else None
+    skip_music = bool(SKIP_TAG_RE.search(reply_text))
+    stop_music = bool(STOP_TAG_RE.search(reply_text))
     reactions = [m.strip() for m in REACT_TAG_RE.findall(reply_text)][:MAX_REACTIONS]
     gif_matches = GIF_TAG_RE.findall(reply_text)
     gif_query = gif_matches[-1].strip() if gif_matches else None
@@ -369,6 +388,10 @@ def parse_actions(
             ),
         ),
     )
+    # Strip the music tags too (they carry no visible text).
+    clean_text = STOP_TAG_RE.sub(
+        "", SKIP_TAG_RE.sub("", PLAY_TAG_RE.sub("", clean_text))
+    )
     # Em/en dashes are banned — swap them out before tidying whitespace.
     clean_text = strip_dashes(clean_text)
     # Pulling a tag from mid-sentence can leave a double space; collapse runs of
@@ -383,6 +406,7 @@ def parse_actions(
     return (
         clean_text, reactions, gif_query, sticker_names, remembers, forgets,
         thread_request, invites, rename_request, disengaged,
+        play_query, skip_music, stop_music,
     )
 
 
@@ -668,6 +692,26 @@ def build_datetime_note() -> str:
     )
 
 
+def build_voice_note(guild: "discord.Guild | None") -> str:
+    """Tell Molly when she's currently sitting in a voice call.
+
+    So she knows her replies are being spoken aloud and that she can play music
+    (the PLAYING MUSIC prompt rules only make sense when she's actually connected).
+    Returns "" when she isn't in a VC in this guild. Volatile/per-turn (its truth
+    changes with /mollyjoin and /mollyleave), so it sits after the cache breakpoint
+    like the datetime/memory notes — see build_system_blocks.
+    """
+    vc = getattr(guild, "voice_client", None) if guild is not None else None
+    if vc is None or not getattr(vc, "is_connected", lambda: False)():
+        return ""
+    return (
+        "\n\nVOICE CALL: You're currently IN the voice channel with people right "
+        "now, and your replies are read out loud in your own voice in there. You "
+        "can play music in this call when someone asks (see the PLAYING MUSIC "
+        "rules). Keep being exactly yourself and type how you always do."
+    )
+
+
 def build_personality_note(guild: "discord.Guild | None", author) -> str:
     """Tell Molly to wear a chosen personality overlay for THIS speaker.
 
@@ -780,6 +824,7 @@ def build_system_blocks(
             build_owner_note(author),
             build_personality_note(guild, author),
             build_creep_note(channel_id, author),
+            build_voice_note(guild),
             build_datetime_note(),
             memory_note,
         )
@@ -1048,6 +1093,7 @@ async def rename_thread_from_conversation(
     reply_text = "".join(b.text for b in response.content if b.type == "text").strip()
     (
         clean_text, _re, _gif, _st, _rem, _fo, _thr, _inv, rename_request, _dis,
+        _play, _skip, _stop,
     ) = parse_actions(reply_text)
     if not rename_request:
         history.pop()  # she didn't emit a name — leave history clean
@@ -1472,6 +1518,71 @@ async def mollypurge(interaction: discord.Interaction) -> None:
 
 
 @tree.command(
+    name="mollyjoin",
+    description="Have Molly join your voice channel and speak her replies aloud. Owner only.",
+)
+async def mollyjoin(interaction: discord.Interaction) -> None:
+    """Owner-only: Molly joins the runner's current voice channel and starts
+    speaking her replies aloud (ElevenLabs TTS — see voice.py).
+
+    Gated to the same controller handle as the height command and /mollynewchat
+    (globally unique, unspoofable). She joins whatever VC the owner is currently
+    in; while connected, deliver_reply also voices her text replies. No-op with a
+    friendly note if voice isn't configured or the owner isn't in a VC. Ephemeral
+    confirmation. /mollyleave disconnects her.
+    """
+    if interaction.user.name.lower() != HEIGHT_CONTROLLER:
+        await interaction.response.send_message(
+            "nah, only my person gets to do that one :p", ephemeral=True
+        )
+        return
+    if not voice.enabled():
+        await interaction.response.send_message(
+            "my voice isn't hooked up rn (no elevenlabs key set) :c", ephemeral=True
+        )
+        return
+    voice_state = getattr(interaction.user, "voice", None)
+    channel = getattr(voice_state, "channel", None)
+    if channel is None:
+        await interaction.response.send_message(
+            "you're not in a voice channel, hop in one n try again :p", ephemeral=True
+        )
+        return
+    # Connecting takes a beat; defer so the interaction doesn't time out.
+    await interaction.response.defer(ephemeral=True)
+    ok = await voice.join(channel)
+    await interaction.followup.send(
+        "kk i'm in the call, talk to me n i'll actually say it back :3"
+        if ok
+        else "ugh couldn't join that one, check my perms? :c",
+        ephemeral=True,
+    )
+
+
+@tree.command(
+    name="mollyleave",
+    description="Have Molly leave the voice channel she's in. Owner only.",
+)
+async def mollyleave(interaction: discord.Interaction) -> None:
+    """Owner-only: disconnect Molly from voice. Ephemeral confirmation.
+
+    Same controller gate as /mollyjoin. She stops speaking replies once she's out
+    (deliver_reply only voices when there's a connected voice client).
+    """
+    if interaction.user.name.lower() != HEIGHT_CONTROLLER:
+        await interaction.response.send_message(
+            "nah, only my person gets to do that one :p", ephemeral=True
+        )
+        return
+    guild = interaction.guild
+    was_in = guild is not None and await voice.leave(guild)
+    await interaction.response.send_message(
+        "kk, hopped out of the call :3" if was_in else "lol i'm not in a call rn :p",
+        ephemeral=True,
+    )
+
+
+@tree.command(
     name="mollythreadrename",
     description="Have Molly rename THIS thread to fit what's been talked about here. Owner only.",
 )
@@ -1620,6 +1731,10 @@ async def on_ready() -> None:
     # Bring up persistent memory (idempotent — on_ready can fire on reconnects).
     # If MySQL isn't configured/reachable it just stays off and the bot runs on.
     await memory.init()
+    # Log the voice dependency health (PyNaCl/ffmpeg/yt-dlp) so a broken voice
+    # runtime shows the REAL reason in the deploy logs, not just discord.py's
+    # blanket "PyNaCl library needed" at join time.
+    print(voice.diagnose())
     # Warm the personality read cache from the DB so people's chosen /personality
     # overlays survive restarts. Empty (and harmless) when memory is disabled;
     # update() so a reconnect-triggered on_ready can't wipe in-session changes.
@@ -1948,6 +2063,7 @@ async def deliver_reply(
     (
         clean_text, reactions, gif_query, sticker_names, remembers, forgets,
         thread_request, invites, rename_request, disengaged,
+        play_query, skip_music, stop_music,
     ) = parse_actions(reply_text)
     guild = message.guild
 
@@ -2009,6 +2125,29 @@ async def deliver_reply(
             await message.channel.send(gif_url)
         else:
             await reply_or_send(message, gif_url)
+
+    # Voice-channel audio, if Molly's connected to a VC in this guild. Both TTS and
+    # music playback are fired off as background tasks tracked in audio_tasks: they
+    # last as long as the audio, far too long to block the reply (or the channel
+    # lock) on. voice.* serialize per guild and swallow their own errors, so a hiccup
+    # never touches the text reply that already sent, and — without a live reference —
+    # the loop could GC a task mid-playback.
+    voice_client = guild.voice_client if guild is not None else None
+    if voice_client is not None:
+        # Music controls first (a [play]/[skip]/[stop] this turn should win over TTS).
+        if stop_music:
+            voice.stop_music(voice_client)
+        elif skip_music:
+            voice.skip(voice_client)
+        if play_query:
+            task = asyncio.create_task(voice.enqueue(voice_client, play_query))
+            audio_tasks.add(task)
+            task.add_done_callback(audio_tasks.discard)
+        # Speak the reply aloud (voice.speak steps aside on its own if music is on).
+        if clean_text:
+            task = asyncio.create_task(voice.speak(voice_client, clean_text))
+            audio_tasks.add(task)
+            task.add_done_callback(audio_tasks.discard)
 
     # Private-thread actions, after the visible reply. The requester (who gets
     # pulled in after the owner) is the current human speaker — memory_subject —

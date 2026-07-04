@@ -1,0 +1,8 @@
+# Railway builds with Nixpacks. The voice feature (voice.py) plays audio through
+# the ffmpeg binary, which isn't part of the auto-detected Python image — install
+# it here. aptPkgs is additive (it doesn't replace the Python toolchain Nixpacks
+# already provisions), so this only adds ffmpeg. Without it, the bot still runs and
+# text replies work; only spoken (voice-channel) replies fail and log "[voice] play
+# failed". PyNaCl (in requirements.txt) covers the other voice dependency.
+[phases.setup]
+aptPkgs = ["ffmpeg"]
