@@ -1731,6 +1731,10 @@ async def on_ready() -> None:
     # Bring up persistent memory (idempotent — on_ready can fire on reconnects).
     # If MySQL isn't configured/reachable it just stays off and the bot runs on.
     await memory.init()
+    # Log the voice dependency health (PyNaCl/ffmpeg/yt-dlp) so a broken voice
+    # runtime shows the REAL reason in the deploy logs, not just discord.py's
+    # blanket "PyNaCl library needed" at join time.
+    print(voice.diagnose())
     # Warm the personality read cache from the DB so people's chosen /personality
     # overlays survive restarts. Empty (and harmless) when memory is disabled;
     # update() so a reconnect-triggered on_ready can't wipe in-session changes.

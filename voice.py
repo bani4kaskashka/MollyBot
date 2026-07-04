@@ -147,6 +147,30 @@ def music_active(guild_id: int) -> bool:
     return guild_id in _now_playing
 
 
+def diagnose() -> str:
+    """One-line startup health check of the voice runtime deps, for the deploy logs.
+
+    discord.py refuses voice with a blanket "PyNaCl library needed in order to use
+    voice" whenever `import nacl` fails for ANY reason — a missing package OR an
+    installed-but-unimportable one (e.g. a shared-lib the slim deploy image lacks).
+    This does the exact imports discord.py does and surfaces the REAL exception, plus
+    whether ffmpeg is actually on PATH and yt-dlp/config are present. Purely
+    diagnostic and always safe to call.
+    """
+    import shutil
+    parts = []
+    try:
+        import nacl.secret  # noqa: F401
+        import nacl.utils  # noqa: F401
+        parts.append("PyNaCl:OK")
+    except Exception as exc:  # noqa: BLE001 — we WANT the real error text
+        parts.append(f"PyNaCl:FAIL({exc!r})")
+    parts.append("ffmpeg:" + ("found" if shutil.which("ffmpeg") else "MISSING"))
+    parts.append("yt-dlp:" + ("OK" if yt_dlp is not None else "MISSING"))
+    parts.append("tts-config:" + ("set" if enabled() else "unset"))
+    return "[voice] deps — " + " | ".join(parts)
+
+
 # --- Shared helpers -----------------------------------------------------------
 async def _get_session() -> aiohttp.ClientSession:
     global _http_session
