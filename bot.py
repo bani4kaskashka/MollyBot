@@ -257,6 +257,10 @@ intents.message_content = True
 # fetched via channel.history() (REST history carries no inline member data).
 # Must also be enabled in the Discord Developer Portal or the bot won't start.
 intents.members = True
+# Voice states — needed so `member.voice` resolves which VC someone is in (drives
+# /mollyjoin). It's part of Intents.default(), but set it explicitly so voice can't
+# silently break if defaults ever change. Not privileged; no portal step.
+intents.voice_states = True
 client = discord.Client(intents=intents)
 # Slash commands hang off a command tree. We only ever sync it to Molly's own
 # guild (in on_ready), so the commands appear in that server and nowhere else.
@@ -1541,8 +1545,17 @@ async def mollyjoin(interaction: discord.Interaction) -> None:
             "my voice isn't hooked up rn (no elevenlabs key set) :c", ephemeral=True
         )
         return
-    voice_state = getattr(interaction.user, "voice", None)
+    # Resolve the runner's voice state. Prefer the cached guild Member (its .voice
+    # is backed by the guild voice-state cache); fall back to interaction.user.
+    member = interaction.user
+    if interaction.guild is not None:
+        member = interaction.guild.get_member(interaction.user.id) or interaction.user
+    voice_state = getattr(member, "voice", None)
     channel = getattr(voice_state, "channel", None)
+    print(
+        f"[voice] /mollyjoin by {interaction.user} — voice_state={voice_state!r}, "
+        f"channel={channel!r}"
+    )
     if channel is None:
         await interaction.response.send_message(
             "you're not in a voice channel, hop in one n try again :p", ephemeral=True
