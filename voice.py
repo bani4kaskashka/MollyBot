@@ -165,6 +165,13 @@ def diagnose() -> str:
         parts.append("PyNaCl:OK")
     except Exception as exc:  # noqa: BLE001 — we WANT the real error text
         parts.append(f"PyNaCl:FAIL({exc!r})")
+    # davey = Discord's DAVE (end-to-end voice encryption) bindings, now REQUIRED
+    # for voice by discord.py; comes from the discord.py[voice] extra.
+    try:
+        import davey  # noqa: F401
+        parts.append("davey:OK")
+    except Exception as exc:  # noqa: BLE001
+        parts.append(f"davey:FAIL({exc!r})")
     parts.append("ffmpeg:" + ("found" if shutil.which("ffmpeg") else "MISSING"))
     parts.append("yt-dlp:" + ("OK" if yt_dlp is not None else "MISSING"))
     parts.append("tts-config:" + ("set" if enabled() else "unset"))
