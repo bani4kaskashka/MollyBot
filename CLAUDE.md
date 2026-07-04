@@ -42,14 +42,28 @@ The bot is these files:
   API shut down in 2026). Without it, GIFs silently no-op and the bot still runs.
 - `ELEVENLABS_API_KEY` + `ELEVENLABS_VOICE_ID` — **optional** (both needed together).
   Enable Molly's **voice** (see the voice section below): she joins a Discord voice
-  channel via the owner's `/mollyjoin` and speaks her replies aloud through the
+  channel via anyone's `/mollyjoin` and speaks her replies aloud through the
   ElevenLabs voice named by `ELEVENLABS_VOICE_ID`. Without **both** set, voice stays
   off and everything runs exactly as before (text-only). `ELEVENLABS_MODEL` is an
   optional third var (defaults to `eleven_flash_v2_5` — fastest and ~0.5 credits/char;
-  set `eleven_multilingual_v2` for top quality at 1 credit/char). Also needs the
-  **ffmpeg** binary (provided by `nixpacks.toml`) and **PyNaCl** (in
-  `requirements.txt`) at runtime — missing either disables playback but doesn't crash
-  the bot.
+  set `eleven_multilingual_v2` for top quality at 1 credit/char). `TTS_MAX_CHARS`
+  (default 1500) caps how much of a reply is spoken. Also needs the **ffmpeg** binary
+  (see deploy note below) and the **`discord.py[voice]`** deps (PyNaCl **and**
+  `davey`, Discord's DAVE end-to-end voice encryption — plain `discord.py` is NOT
+  enough; without davey `/mollyjoin` fails with "davey library needed in order to
+  use voice") at runtime. Missing any of these disables voice but doesn't crash the bot.
+- **Music (YouTube) env** — all optional, only relevant once she's in a VC:
+  `YOUTUBE_COOKIES` (paste a logged-in `cookies.txt`'s **contents**; use a throwaway
+  Google account — YouTube can ban accounts used from a datacenter IP; cookies expire
+  and need re-pasting), or `YTDLP_COOKIES_FILE` (a path instead). `POT_PROVIDER_URL`
+  points at a **bgutil PO-token provider** service (see the voice section) — YouTube
+  serves Railway's IP only PO-token/SABR formats, so **music needs BOTH cookies and
+  this provider** in practice. `YTDLP_PLAYER_CLIENTS` (comma-sep) overrides which
+  yt-dlp player clients are tried.
+- **`ffmpeg` on Railway**: Railway builds with **Railpack, not Nixpacks**, so the
+  repo's `nixpacks.toml` is ignored — install ffmpeg by setting the Railway variable
+  `RAILPACK_DEPLOY_APT_PACKAGES=ffmpeg`. (`nixpacks.toml` is kept only as a fallback
+  if the builder is ever switched to Nixpacks.)
 - `HEIGHT_CONTROLLER` — **optional**. Discord **handle** (`message.author.name`,
   not the per-server nickname) allowed to use the height command; defaults to
   `ca11mebucky`. Gating on the handle is deliberate — it's globally unique and
@@ -463,14 +477,17 @@ ElevenLabs TTS voice, and **play YouTube music** on request. This is **Phase 1**
 voice: TTS + music (she *speaks* and *DJs*), no listening/wake-word yet. Optional
 and self-contained (`voice.py`), same graceful-no-op spirit as `memory.py`/GIFs —
 TTS is off unless `ELEVENLABS_API_KEY` **and** `ELEVENLABS_VOICE_ID` are set (and
-ffmpeg + PyNaCl present); music is off unless `yt-dlp` (+ ffmpeg) is present. Each
-degrades independently.
+ffmpeg + the `discord.py[voice]` deps present); music is off unless `yt-dlp` (+
+ffmpeg) is present, and in practice needs **cookies + a PO-token provider** to get
+past YouTube's datacenter-IP blocks (see the Music bullet). Each degrades
+independently.
 
-- **Owner-driven join** (deliberate, per the maintainer's call — not auto-join).
-  `/mollyjoin` (owner-only, gated on the `HEIGHT_CONTROLLER` handle like the other
-  owner commands) connects her to **whatever VC the runner is currently in**;
-  `/mollyleave` disconnects. Both are ephemeral, in-character. She can only be in
-  one VC per guild (Discord's model); `join()` `move_to`s if already connected.
+- **On-request join** (deliberate — not auto-join). `/mollyjoin` connects her to
+  **whatever VC the runner is currently in**; `/mollyleave` disconnects. Both are
+  **open to everyone** (unlike the owner-only height/newchat/etc. commands) — leave
+  is open too so anyone who can summon her can also release her (otherwise she'd get
+  stuck in a call). Both are ephemeral, in-character. She can only be in one VC per
+  guild (Discord's model); `join()` `move_to`s if already connected.
 - **What gets spoken**: the hook is a **single block in `deliver_reply`** — the same
   central chokepoint every reply path flows through — so *any* reply she posts while
   voice-connected in that guild (normal chat, reaction replies, the height jolt;
@@ -497,6 +514,25 @@ degrades independently.
   song is active `voice.speak` **steps aside** (she still replies in text) — tracked
   by `voice.music_active()` off the `_now_playing` state. `/mollyleave` clears the
   queue. Music is free (YouTube audio); it's a CPU/bandwidth cost, not an API bill.
+- **Getting YouTube to actually play from a server IP (the hard part).** YouTube
+  aggressively blocks datacenter IPs (Railway's), and it took layered workarounds
+  — all env-driven in `voice._build_ytdl_opts`, in order of what YouTube throws:
+  (1) **"Sign in to confirm you're not a bot"** → **cookies** (`YOUTUBE_COOKIES`
+  contents, written to a temp file at import; a throwaway account, since datacenter
+  use can get an account banned). (2) **"Requested format is not available"** even
+  for bare `best` / **`formats=NONE`** → YouTube serves only **PO-token/SABR**
+  formats; solved by the **bgutil PO-token provider** (`POT_PROVIDER_URL` →
+  `bgutil-ytdlp-pot-provider` plugin, requirements.txt), a **separate service** you
+  run alongside the bot (Railway: deploy the `brainicism/bgutil-ytdlp-pot-provider`
+  Docker image, reach it over private networking at
+  `http://<name>.railway.internal:4416`). With a provider set we let yt-dlp use its
+  default clients (they consume the tokens); without one we fall back to the
+  `ios/tv/mweb/android` clients (`YTDLP_PLAYER_CLIENTS` overrides). We also set
+  `ignore_no_formats_error` and pick an audio format ourselves in
+  `voice._pick_audio_url` (so a selector miss can't blank us; it logs the real
+  format list — `formats=NONE` is the "PO-token wall" tell). **Both cookies AND the
+  provider are needed in practice.** Both are fragile: cookies **expire** (re-paste),
+  and the provider service must stay up (`formats=NONE` returns if it's down).
 - **Fire-and-forget, never blocks**: `deliver_reply` schedules `voice.speak(...)` /
   `voice.enqueue(...)` as background tasks (tracked in `bot.py`'s `audio_tasks` set
   so they aren't GC'd) — synthesis/lookup + playback last as long as the audio, far
@@ -505,22 +541,35 @@ degrades independently.
   `PLAYBACK_TIMEOUT_SECONDS` safety valve) so overlapping replies queue in order
   instead of colliding ("Already playing audio"). Errors are swallowed — a TTS/music
   failure never touches the text reply that already sent.
+- **TTS playback goes via a temp FILE, not a pipe.** `voice.speak` writes the
+  ElevenLabs mp3 to a temp file and plays that (`FFmpegPCMAudio(path)`), deleting it
+  after. Feeding ffmpeg an in-memory pipe (`BytesIO`, `pipe=True`) **truncated longer
+  clips** — she'd cut off mid-sentence — so the file path is deliberate; don't
+  "optimize" it back to a pipe.
 - **Cost lever** (same "tune eagerness" caveat as GIFs/web search): ElevenLabs bills
   **per character**. Defaults to the **Flash** model (`ELEVENLABS_MODEL`, ~0.5
-  credits/char, low latency) and clips each utterance at `MAX_TTS_CHARS` (600) —
-  she still POSTS the full text, only the spoken version is capped. Continuous
-  listening is intentionally NOT here (it would be the expensive always-on part);
-  see the next-steps note.
+  credits/char, low latency) and clips each utterance at `MAX_TTS_CHARS` (default
+  1500, env `TTS_MAX_CHARS`) — she still POSTS the full text, only the spoken version
+  is capped. `PLAYBACK_TIMEOUT_SECONDS` must stay above the audio length that cap can
+  produce. Continuous listening is intentionally NOT here (the expensive always-on
+  part); see the next-steps note.
 - **`build_voice_note`** (in `bot.py`, appended to the volatile/uncached part of the
   system prompt) tells her when she's *currently in a call* — so she knows her
   replies are spoken and that the PLAYING MUSIC rules are live. It's per-turn (its
   truth flips with `/mollyjoin`/`/mollyleave`), so it sits after the cache breakpoint
   with the datetime/memory notes and never invalidates the cached persona prefix.
-- **Deps/deploy**: `PyNaCl` (Discord voice) + `yt-dlp` (music) in `requirements.txt`;
-  the **ffmpeg** binary via `nixpacks.toml` (`aptPkgs = ["ffmpeg"]`, additive on
-  Railway). Discord perms: **Connect** + **Speak**. The `voice_states` intent is
-  non-privileged and already on via `Intents.default()`, so `interaction.user.voice`
-  resolves the runner's current VC with no extra portal step.
+- **Startup diagnostic**: `voice.diagnose()` (called in `on_ready`) logs one line —
+  `[voice] deps — PyNaCl:… | davey:… | ffmpeg:… | yt-dlp:… | yt-cookies:… |
+  pot-provider:… | tts-config:…` — the fast way to see what's configured/broken.
+  `voice.join`'s failure path also dumps a full traceback + `discord.has_nacl`.
+- **Deps/deploy**: `discord.py[voice]` (pulls **PyNaCl + davey**), `yt-dlp`, and
+  `bgutil-ytdlp-pot-provider` (the PO-token plugin) in `requirements.txt`; the
+  **ffmpeg** binary via the Railway var `RAILPACK_DEPLOY_APT_PACKAGES=ffmpeg`
+  (Railway uses Railpack, which ignores `nixpacks.toml`). Discord perms: **Connect**
+  + **Speak**. `intents.voice_states` is set explicitly (also on via
+  `Intents.default()`) so `interaction.user.voice` resolves the runner's current VC.
+  Music additionally needs the **bgutil provider service** deployed + `POT_PROVIDER_URL`
+  (see the music bullet above).
 - **Not yet built: listening / "Hey Molly".** Phase 2 is voice *receive*
   (`discord-ext-voice-recv` on discord.py, or a py-cord migration) + a wake-word
   engine (Picovoice **Porcupine**, custom "Hey Molly" keyword — keeps always-on

@@ -708,12 +708,23 @@ def build_voice_note(guild: "discord.Guild | None") -> str:
     vc = getattr(guild, "voice_client", None) if guild is not None else None
     if vc is None or not getattr(vc, "is_connected", lambda: False)():
         return ""
-    return (
+    note = (
         "\n\nVOICE CALL: You're currently IN the voice channel with people right "
         "now, and your replies are read out loud in your own voice in there. You "
         "can play music in this call when someone asks (see the PLAYING MUSIC "
         "rules). Keep being exactly yourself and type how you always do."
     )
+    # While a song is actually playing, the audio is the music, not her voice —
+    # her spoken replies step aside (voice.speak no-ops during music). Tell her so
+    # she doesn't claim to be "saying this out loud" mid-song; she still chats in
+    # text exactly the same. Per-turn, so it flips off the moment the song ends.
+    if guild is not None and voice.music_active(guild.id):
+        note += (
+            " Right now a song's playing, so your voice is taking a backseat to "
+            "the music, people just read you in text until it's done. Don't say "
+            "you're speaking out loud while the song's on; just chat normally."
+        )
+    return note
 
 
 def build_personality_note(guild: "discord.Guild | None", author) -> str:
@@ -1523,23 +1534,18 @@ async def mollypurge(interaction: discord.Interaction) -> None:
 
 @tree.command(
     name="mollyjoin",
-    description="Have Molly join your voice channel and speak her replies aloud. Owner only.",
+    description="Have Molly join your voice channel and speak her replies aloud.",
 )
 async def mollyjoin(interaction: discord.Interaction) -> None:
-    """Owner-only: Molly joins the runner's current voice channel and starts
-    speaking her replies aloud (ElevenLabs TTS — see voice.py).
+    """Anyone can pull Molly into their current voice channel; she then speaks her
+    replies aloud (ElevenLabs TTS — see voice.py).
 
-    Gated to the same controller handle as the height command and /mollynewchat
-    (globally unique, unspoofable). She joins whatever VC the owner is currently
-    in; while connected, deliver_reply also voices her text replies. No-op with a
-    friendly note if voice isn't configured or the owner isn't in a VC. Ephemeral
-    confirmation. /mollyleave disconnects her.
+    Open to everyone (deliberately, unlike the owner-only height/newchat commands)
+    — she joins whatever VC the runner is currently in; while connected,
+    deliver_reply also voices her text replies. No-op with a friendly note if voice
+    isn't configured or the runner isn't in a VC. Ephemeral confirmation.
+    /mollyleave disconnects her.
     """
-    if interaction.user.name.lower() != HEIGHT_CONTROLLER:
-        await interaction.response.send_message(
-            "nah, only my person gets to do that one :p", ephemeral=True
-        )
-        return
     if not voice.enabled():
         await interaction.response.send_message(
             "my voice isn't hooked up rn (no elevenlabs key set) :c", ephemeral=True
@@ -1574,19 +1580,16 @@ async def mollyjoin(interaction: discord.Interaction) -> None:
 
 @tree.command(
     name="mollyleave",
-    description="Have Molly leave the voice channel she's in. Owner only.",
+    description="Have Molly leave the voice channel she's in.",
 )
 async def mollyleave(interaction: discord.Interaction) -> None:
-    """Owner-only: disconnect Molly from voice. Ephemeral confirmation.
+    """Disconnect Molly from voice. Ephemeral confirmation.
 
-    Same controller gate as /mollyjoin. She stops speaking replies once she's out
-    (deliver_reply only voices when there's a connected voice client).
+    Open to everyone, same as /mollyjoin — otherwise anyone could summon her into
+    a call but only the owner could pull her back out. She stops speaking replies
+    once she's out (deliver_reply only voices when there's a connected voice
+    client).
     """
-    if interaction.user.name.lower() != HEIGHT_CONTROLLER:
-        await interaction.response.send_message(
-            "nah, only my person gets to do that one :p", ephemeral=True
-        )
-        return
     guild = interaction.guild
     was_in = guild is not None and await voice.leave(guild)
     await interaction.response.send_message(
