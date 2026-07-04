@@ -234,7 +234,17 @@ async def join(channel) -> bool:
             await channel.connect()
         return True
     except Exception as exc:  # noqa: BLE001 — perms/deps issues shouldn't crash the command
-        print(f"[voice] join failed: {exc}")
+        # Full traceback + discord's own nacl flag, so a genuine failure is
+        # unambiguous (vs. discord.py's blanket "PyNaCl library needed" text).
+        import traceback
+        has_nacl = "?"
+        try:
+            import discord.voice_client as _vc
+            has_nacl = getattr(_vc, "has_nacl", "?")
+        except Exception:  # noqa: BLE001
+            pass
+        print(f"[voice] join failed: {exc!r} (discord.has_nacl={has_nacl})")
+        traceback.print_exc()
         return False
 
 
