@@ -1,6 +1,7 @@
 discord.py[voice]
 PyNaCl
 yt-dlp
+bgutil-ytdlp-pot-provider
 anthropic
 python-dotenv
 aiohttp

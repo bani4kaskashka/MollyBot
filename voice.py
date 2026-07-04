@@ -124,11 +124,16 @@ if _cookies_inline and not _COOKIES_FILE:
         print(f"[voice] could not write YOUTUBE_COOKIES to a temp file: {_exc}")
         _COOKIES_FILE = None
 
-# The default YouTube `web` client increasingly serves only SABR/PO-token formats
-# that yt-dlp can't hand to ffmpeg as a direct URL ("Requested format is not
-# available", even for bare `best`). The `ios`/`tv`/`mweb`/`android` clients still
-# return real progressive/HLS audio URLs, so we prefer them ALWAYS (cookies handle
-# the bot check on top). Override the tried clients with YTDLP_PLAYER_CLIENTS.
+# PO-token provider (bgutil). YouTube now serves only SABR/PO-token formats to
+# datacenter IPs — even bare `best` gives "no formats". The bgutil provider (a
+# companion HTTP service, its yt-dlp plugin is in requirements.txt) mints the
+# tokens that unlock real formats. Set POT_PROVIDER_URL to the provider's URL
+# (e.g. http://bgutil-pot.railway.internal:4416) to enable it.
+_POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL")
+
+# Player-client selection. With a POT provider the DEFAULT clients (web/mweb) work
+# and consume the tokens, so we don't force anything. WITHOUT one, the ios/tv/…
+# clients are the best shot at real audio URLs. YTDLP_PLAYER_CLIENTS overrides both.
 _PLAYER_CLIENTS_ENV = os.environ.get("YTDLP_PLAYER_CLIENTS")
 _DEFAULT_ALT_CLIENTS = ["ios", "tv", "mweb", "android"]
 
@@ -136,14 +141,16 @@ _DEFAULT_ALT_CLIENTS = ["ios", "tv", "mweb", "android"]
 def _player_clients() -> list[str]:
     if _PLAYER_CLIENTS_ENV is not None:
         return [c.strip() for c in _PLAYER_CLIENTS_ENV.split(",") if c.strip()]
+    if _POT_PROVIDER_URL:
+        return []  # let yt-dlp use its defaults so the PO tokens get used
     return _DEFAULT_ALT_CLIENTS
 
 
 def _build_ytdl_opts() -> dict:
     """yt-dlp options: audio, no playlists, plus the datacenter-IP workarounds
-    (alt player_clients + cookies). `ignore_no_formats_error` keeps a format-selector
-    miss non-fatal so we can pick an audio format from the list ourselves (see
-    _resolve_blocking). Built per call so env-driven cookies/clients apply live.
+    (PO-token provider, alt player_clients, cookies). `ignore_no_formats_error` keeps
+    a format-selector miss non-fatal so we can pick an audio format from the list
+    ourselves (see _resolve_blocking). Built per call so env changes apply live.
     """
     opts = {
         "format": "bestaudio/best",
@@ -154,9 +161,15 @@ def _build_ytdl_opts() -> dict:
         "cachedir": False,
         "ignore_no_formats_error": True,
     }
+    extractor_args: dict = {}
     clients = _player_clients()
     if clients:
-        opts["extractor_args"] = {"youtube": {"player_client": clients}}
+        extractor_args["youtube"] = {"player_client": clients}
+    if _POT_PROVIDER_URL:
+        # bgutil HTTP provider: tell its plugin where the service lives.
+        extractor_args["youtubepot-bgutilhttp"] = {"base_url": [_POT_PROVIDER_URL]}
+    if extractor_args:
+        opts["extractor_args"] = extractor_args
     if _COOKIES_FILE:
         opts["cookiefile"] = _COOKIES_FILE
     return opts
@@ -255,6 +268,7 @@ def diagnose() -> str:
     parts.append("ffmpeg:" + ("found" if shutil.which("ffmpeg") else "MISSING"))
     parts.append("yt-dlp:" + ("OK" if yt_dlp is not None else "MISSING"))
     parts.append("yt-cookies:" + ("set" if _COOKIES_FILE else "none"))
+    parts.append("pot-provider:" + ("set" if _POT_PROVIDER_URL else "none"))
     parts.append("tts-config:" + ("set" if enabled() else "unset"))
     return "[voice] deps — " + " | ".join(parts)
 
