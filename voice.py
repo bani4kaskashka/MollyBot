@@ -111,11 +111,7 @@ _UNICODE_EMOJI_RE = re.compile(
 #     durable fix on a server IP. Provide EITHER the cookies.txt *contents* in
 #     YOUTUBE_COOKIES (handy on Railway — paste into a variable) or a path in
 #     YTDLP_COOKIES_FILE. YOUTUBE_COOKIES is written to a temp file at import.
-_PLAYER_CLIENTS = [
-    c.strip()
-    for c in os.environ.get("YTDLP_PLAYER_CLIENTS", "tv,ios,web_safari,android").split(",")
-    if c.strip()
-]
+# Cookies first — they determine whether we also need the player_client hack.
 _COOKIES_FILE = os.environ.get("YTDLP_COOKIES_FILE")
 _cookies_inline = os.environ.get("YOUTUBE_COOKIES")
 if _cookies_inline and not _COOKIES_FILE:
@@ -128,11 +124,24 @@ if _cookies_inline and not _COOKIES_FILE:
         print(f"[voice] could not write YOUTUBE_COOKIES to a temp file: {_exc}")
         _COOKIES_FILE = None
 
+# Explicit override always wins; otherwise the alt-client hack is only applied when
+# we have NO cookies. The alt clients (tv/ios/…) dodge the bot check but hand back
+# odd/limited format sets — with cookies the DEFAULT client works AND returns proper
+# audio formats, so forcing them there causes "Requested format is not available".
+_PLAYER_CLIENTS_ENV = os.environ.get("YTDLP_PLAYER_CLIENTS")
+_DEFAULT_ALT_CLIENTS = ["tv", "ios", "web_safari", "android"]
+
+
+def _player_clients() -> list[str]:
+    if _PLAYER_CLIENTS_ENV is not None:
+        return [c.strip() for c in _PLAYER_CLIENTS_ENV.split(",") if c.strip()]
+    return [] if _COOKIES_FILE else _DEFAULT_ALT_CLIENTS
+
 
 def _build_ytdl_opts() -> dict:
     """yt-dlp options: best audio-only, no playlists, plus the datacenter-IP
-    workarounds (player_client override + cookies) when configured. Built per call
-    so env-driven cookies/clients apply without a code change.
+    workarounds (cookies and/or player_client override) when configured. Built per
+    call so env-driven cookies/clients apply without a code change.
     """
     opts = {
         "format": "bestaudio/best",
@@ -143,8 +152,9 @@ def _build_ytdl_opts() -> dict:
         "source_address": "0.0.0.0",
         "cachedir": False,
     }
-    if _PLAYER_CLIENTS:
-        opts["extractor_args"] = {"youtube": {"player_client": _PLAYER_CLIENTS}}
+    clients = _player_clients()
+    if clients:
+        opts["extractor_args"] = {"youtube": {"player_client": clients}}
     if _COOKIES_FILE:
         opts["cookiefile"] = _COOKIES_FILE
     return opts
@@ -430,13 +440,26 @@ def _resolve_blocking(query: str) -> "dict | None":
     """
     is_url = query.strip().lower().startswith(("http://", "https://"))
     target = query if is_url else f"ytsearch1:{query}"
-    try:
-        with yt_dlp.YoutubeDL(_build_ytdl_opts()) as ydl:
-            info = ydl.extract_info(target, download=False)
-    except Exception as exc:  # noqa: BLE001
-        print(f"[voice] yt-dlp lookup failed for {query!r}: {exc}")
-        return None
+    # Try the configured format, then fall back to a looser one if YouTube handed
+    # back a format set our selector didn't match ("Requested format is not
+    # available"). Each fallback is one more lookup, so keep the list short.
+    info = None
+    last_exc = None
+    for fmt in ("bestaudio/best", "best", "bestaudio*/best"):
+        opts = _build_ytdl_opts()
+        opts["format"] = fmt
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(target, download=False)
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            # Only worth retrying when it's a format-availability miss; anything
+            # else (bot check, private, network) will fail the same way each time.
+            if "format is not available" not in str(exc).lower():
+                break
     if info is None:
+        print(f"[voice] yt-dlp lookup failed for {query!r}: {last_exc}")
         return None
     if "entries" in info:
         entries = [e for e in (info.get("entries") or []) if e]
