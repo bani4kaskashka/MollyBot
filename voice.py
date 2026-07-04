@@ -24,7 +24,6 @@ each utterance at MAX_TTS_CHARS. Music is free (YouTube audio), just CPU/bandwid
 """
 
 import asyncio
-import io
 import os
 import re
 from collections import deque
@@ -57,11 +56,14 @@ ELEVENLABS_MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_flash_v2_5")
 TTS_OUTPUT_FORMAT = "mp3_44100_128"
 # Hard ceiling on how much of one reply we voice. Keeps cost bounded and stops her
 # reading a giant paragraph over everyone. She still POSTS the full text; only the
-# spoken version is clipped.
-MAX_TTS_CHARS = 600
+# spoken version is clipped. Overridable via TTS_MAX_CHARS (raise for longer spoken
+# replies at more ElevenLabs cost; PLAYBACK_TIMEOUT_SECONDS must stay above however
+# long the resulting audio can run).
+MAX_TTS_CHARS = int(os.environ.get("TTS_MAX_CHARS", "1500"))
 # Safety valve so a stuck/never-finishing playback can't hold the per-guild lock
-# forever (e.g. if the after-callback never fires). Generous — real lines are short.
-PLAYBACK_TIMEOUT_SECONDS = 120
+# forever (e.g. if the after-callback never fires). Must comfortably exceed the
+# real audio length for MAX_TTS_CHARS (~15 chars/sec of speech → 1500 chars ≈ 100s).
+PLAYBACK_TIMEOUT_SECONDS = 300
 # Music playback level (0..1). A touch under full so it isn't ear-splitting and,
 # once ducking lands, so her voice can sit over it.
 MUSIC_VOLUME = 0.6
@@ -231,6 +233,14 @@ def _play_lock(guild_id: int) -> asyncio.Lock:
     return lock
 
 
+def _safe_unlink(path: str) -> None:
+    """Delete a temp file, ignoring any error (best-effort cleanup)."""
+    try:
+        os.remove(path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _clean_for_speech(text: str) -> str:
     """Prep Molly's visible reply text for TTS (only the spoken copy is affected).
 
@@ -327,7 +337,7 @@ async def synthesize(text: str) -> "bytes | None":
     try:
         async with session.post(
             url, params=params, headers=headers, json=body,
-            timeout=aiohttp.ClientTimeout(total=30),
+            timeout=aiohttp.ClientTimeout(total=60),
         ) as resp:
             if resp.status != 200:
                 detail = (await resp.text())[:300]
@@ -365,10 +375,24 @@ async def speak(voice_client, text: str) -> None:
     if not audio:
         return
 
+    # Write the mp3 to a temp FILE and let ffmpeg read the whole thing. Feeding it
+    # via an in-memory pipe (BytesIO, pipe=True) truncates longer clips — the stdin
+    # writer thread and ffmpeg race and the audio cuts off mid-sentence — so a real
+    # file is the reliable path. Cleaned up once playback ends.
+    import tempfile
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix="molly_tts_", suffix=".mp3")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(audio)
+    except Exception as exc:  # noqa: BLE001 — disk hiccup mustn't break the reply
+        print(f"[voice] could not buffer TTS audio: {exc}")
+        return
+
     async with _play_lock(guild_id):
         # Re-check: the owner may have run /mollyleave, or a song may have started,
         # while we were synthesizing.
         if not voice_client.is_connected() or music_active(guild_id):
+            _safe_unlink(tmp_path)
             return
         loop = asyncio.get_running_loop()
         done = asyncio.Event()
@@ -379,10 +403,11 @@ async def speak(voice_client, text: str) -> None:
             loop.call_soon_threadsafe(done.set)
 
         try:
-            source = discord.FFmpegPCMAudio(io.BytesIO(audio), pipe=True)
+            source = discord.FFmpegPCMAudio(tmp_path)
             voice_client.play(source, after=_after)
         except Exception as exc:  # noqa: BLE001 — missing ffmpeg / already playing / etc.
             print(f"[voice] play failed: {exc}")
+            _safe_unlink(tmp_path)
             return
         try:
             await asyncio.wait_for(done.wait(), timeout=PLAYBACK_TIMEOUT_SECONDS)
@@ -392,6 +417,8 @@ async def speak(voice_client, text: str) -> None:
                 voice_client.stop()
             except Exception:  # noqa: BLE001
                 pass
+        finally:
+            _safe_unlink(tmp_path)
 
 
 # --- YouTube music ------------------------------------------------------------
