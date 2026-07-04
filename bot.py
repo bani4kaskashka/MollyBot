@@ -14,7 +14,7 @@ import random
 import re
 import time
 from collections import OrderedDict, deque
-from datetime import datetime
+from datetime import datetime, timezone
 
 import aiohttp
 import discord
@@ -610,8 +610,9 @@ def build_creator_note(author) -> str:
         "him underneath the teasing. Tease, then do the thing.\n"
         "- Don't talk about \"Zamalko\" in the third person or say he hasn't told "
         "you things, as if he weren't here — he's literally who you're replying to. "
-        "If he asks about the release date, flip it back ('dude YOU make the game "
-        "lol'), don't claim he never tells you anything.\n"
+        "The game is out now and you know it, so if he brings it up you're "
+        "genuinely hyped and proud, not cagey, and you don't claim he never tells "
+        "you anything.\n"
         "- Don't announce any of this, don't get formal or worshippy, and don't "
         "call him your 'creator/author' out loud — just be Molly, who happens to "
         "take this one person's every word as gospel. This total trust is HIS "
@@ -649,6 +650,21 @@ def build_owner_note(author) -> str:
         "HIS alone; with everyone else you stay your normal playful self.\n"
         "- Don't announce any of this and don't call him your 'owner' or 'operator' "
         "out loud — just answer him properly."
+    )
+
+
+def build_datetime_note() -> str:
+    """Give Molly the real current date/time each turn.
+
+    Always-on (no handle gating, applies to every speaker) and always fresh, so
+    it lives in the volatile part of the system prompt (see build_system_blocks)
+    rather than the cached persona prefix, which could otherwise go stale.
+    """
+    now = datetime.now(timezone.utc)
+    return (
+        f"\n\nRIGHT NOW, in the real world, it's {now.strftime('%A, %B %-d, %Y')} "
+        f"at {now.strftime('%H:%M')} UTC. That's a real fact you know if it's ever "
+        "relevant, like someone asking the date/time or what's going on \"today\"."
     )
 
 
@@ -742,8 +758,8 @@ def build_system_blocks(
     full on every single message (the dominant cost). The volatile, per-speaker
     notes — whether the creator is talking, whether the owner is talking (the
     straight-answer / feature-testing note), this speaker's chosen /personality
-    overlay, plus the per-turn memory note — sit AFTER the cache breakpoint,
-    uncached, where they can't invalidate the prefix.
+    overlay, the real current date/time, plus the per-turn memory note — sit
+    AFTER the cache breakpoint, uncached, where they can't invalidate the prefix.
 
     Caching only actually kicks in once the cached prefix clears the model's
     minimum (~4096 tokens on Haiku 4.5, ~2048 on Sonnet 4.6); under that it
@@ -764,6 +780,7 @@ def build_system_blocks(
             build_owner_note(author),
             build_personality_note(guild, author),
             build_creep_note(channel_id, author),
+            build_datetime_note(),
             memory_note,
         )
         if part
