@@ -124,24 +124,26 @@ if _cookies_inline and not _COOKIES_FILE:
         print(f"[voice] could not write YOUTUBE_COOKIES to a temp file: {_exc}")
         _COOKIES_FILE = None
 
-# Explicit override always wins; otherwise the alt-client hack is only applied when
-# we have NO cookies. The alt clients (tv/ios/…) dodge the bot check but hand back
-# odd/limited format sets — with cookies the DEFAULT client works AND returns proper
-# audio formats, so forcing them there causes "Requested format is not available".
+# The default YouTube `web` client increasingly serves only SABR/PO-token formats
+# that yt-dlp can't hand to ffmpeg as a direct URL ("Requested format is not
+# available", even for bare `best`). The `ios`/`tv`/`mweb`/`android` clients still
+# return real progressive/HLS audio URLs, so we prefer them ALWAYS (cookies handle
+# the bot check on top). Override the tried clients with YTDLP_PLAYER_CLIENTS.
 _PLAYER_CLIENTS_ENV = os.environ.get("YTDLP_PLAYER_CLIENTS")
-_DEFAULT_ALT_CLIENTS = ["tv", "ios", "web_safari", "android"]
+_DEFAULT_ALT_CLIENTS = ["ios", "tv", "mweb", "android"]
 
 
 def _player_clients() -> list[str]:
     if _PLAYER_CLIENTS_ENV is not None:
         return [c.strip() for c in _PLAYER_CLIENTS_ENV.split(",") if c.strip()]
-    return [] if _COOKIES_FILE else _DEFAULT_ALT_CLIENTS
+    return _DEFAULT_ALT_CLIENTS
 
 
 def _build_ytdl_opts() -> dict:
-    """yt-dlp options: best audio-only, no playlists, plus the datacenter-IP
-    workarounds (cookies and/or player_client override) when configured. Built per
-    call so env-driven cookies/clients apply without a code change.
+    """yt-dlp options: audio, no playlists, plus the datacenter-IP workarounds
+    (alt player_clients + cookies). `ignore_no_formats_error` keeps a format-selector
+    miss non-fatal so we can pick an audio format from the list ourselves (see
+    _resolve_blocking). Built per call so env-driven cookies/clients apply live.
     """
     opts = {
         "format": "bestaudio/best",
@@ -149,8 +151,8 @@ def _build_ytdl_opts() -> dict:
         "quiet": True,
         "no_warnings": True,
         "default_search": "ytsearch",
-        "source_address": "0.0.0.0",
         "cachedir": False,
+        "ignore_no_formats_error": True,
     }
     clients = _player_clients()
     if clients:
@@ -158,6 +160,35 @@ def _build_ytdl_opts() -> dict:
     if _COOKIES_FILE:
         opts["cookiefile"] = _COOKIES_FILE
     return opts
+
+
+def _pick_audio_url(info: dict) -> "str | None":
+    """Choose a playable audio stream URL from a yt-dlp info dict.
+
+    Prefers whatever yt-dlp already selected (`info['url']`); otherwise picks from
+    `info['formats']` directly — audio-only first, then highest bitrate — so a
+    format-*selector* miss can't blank us as long as SOME audio format has a URL.
+    Returns None (and logs the available formats) when nothing is playable, which
+    is the real "PO-token/SABR only" signal.
+    """
+    url = info.get("url")
+    if url:
+        return url
+    formats = info.get("formats") or []
+    playable = [f for f in formats if f.get("url") and f.get("acodec") not in (None, "none")]
+    # audio-only (no video) first, then by bitrate.
+    playable.sort(
+        key=lambda f: (f.get("vcodec") in (None, "none"), f.get("abr") or 0),
+        reverse=True,
+    )
+    if playable:
+        return playable[0]["url"]
+    summary = [
+        f"{f.get('format_id')}({f.get('protocol')},a={f.get('acodec')})"
+        for f in formats
+    ][:12]
+    print(f"[voice] no playable audio format; formats={summary or 'NONE'}")
+    return None
 
 
 # Reconnect flags matter for long YouTube streams; -vn drops any video.
@@ -440,34 +471,23 @@ def _resolve_blocking(query: str) -> "dict | None":
     """
     is_url = query.strip().lower().startswith(("http://", "https://"))
     target = query if is_url else f"ytsearch1:{query}"
-    # Try the configured format, then fall back to a looser one if YouTube handed
-    # back a format set our selector didn't match ("Requested format is not
-    # available"). Each fallback is one more lookup, so keep the list short.
-    info = None
-    last_exc = None
-    for fmt in ("bestaudio/best", "best", "bestaudio*/best"):
-        opts = _build_ytdl_opts()
-        opts["format"] = fmt
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(target, download=False)
-            break
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            # Only worth retrying when it's a format-availability miss; anything
-            # else (bot check, private, network) will fail the same way each time.
-            if "format is not available" not in str(exc).lower():
-                break
+    try:
+        with yt_dlp.YoutubeDL(_build_ytdl_opts()) as ydl:
+            info = ydl.extract_info(target, download=False)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[voice] yt-dlp lookup failed for {query!r}: {exc}")
+        return None
     if info is None:
-        print(f"[voice] yt-dlp lookup failed for {query!r}: {last_exc}")
         return None
     if "entries" in info:
         entries = [e for e in (info.get("entries") or []) if e]
         if not entries:
             return None
         info = entries[0]
-    stream_url = info.get("url")
+    # Pick an audio URL ourselves so a format-selector miss can't blank us.
+    stream_url = _pick_audio_url(info)
     if not stream_url:
+        print(f"[voice] no playable audio for {query!r}")
         return None
     return {
         "title": info.get("title") or "something",
